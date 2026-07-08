@@ -316,7 +316,7 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     checkTimeoutInterval: 120000,   // 2 minutes (internal mineflayer timeout)
     keepAlive: true,                // send frequent keep-alive packets to server
     keepAliveInterval: 5000,        // send every 5 seconds
-    hideErrors: true
+    hideErrors: false
   });
   
   bot.botId = botNumber;
