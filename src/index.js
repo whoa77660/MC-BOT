@@ -1656,7 +1656,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   // Keep-alive: pings own Render URL every 49 seconds
 const KEEP_ALIVE_URL = process.env.RENDER_URL || "https://mc-bot-39ur.onrender.com/";
-const KEEP_ALIVE_INTERVAL = 49 * 1000;
+const KEEP_ALIVE_INTERVAL = 40 * 1000;
 
 function keepAlive() {
   const url = new URL(KEEP_ALIVE_URL);
