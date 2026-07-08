@@ -29,7 +29,10 @@ let botTargets = new Map(); // botId -> {targetPlayer, lastMessageTime}
 // Store bot control states
 let botControlStates = new Map(); // botId -> 'RUNNING' | 'STOPPED'
 // Track active timers/intervals per bot so we can clean them up on disconnect
-let botTimers = new Map(); // botId -> { movementTimeout, heartbeatInterval, combatInterval }
+let botTimers = new Map(); // botId -> { movementTimeout, heartbeatInterval, combatInterval, miningTimeout }
+// Mining mode config per bot: { enabled, corner1: {x,y,z}, corner2: {x,y,z}, blocks: [names] }
+// Mining is OFF by default and only runs when explicitly enabled via the API for a given bot.
+let botMiningConfig = new Map(); // botId -> { enabled, corner1, corner2, blocks }
 // Global leave mode
 let globalLeaveMode = false;
 let globalLeaveTimeout = null;
@@ -87,6 +90,7 @@ function clearBotTimers(botId) {
   if (timers.movementTimeout) clearTimeout(timers.movementTimeout);
   if (timers.heartbeatInterval) clearInterval(timers.heartbeatInterval);
   if (timers.combatInterval) clearInterval(timers.combatInterval);
+  if (timers.miningTimeout) clearTimeout(timers.miningTimeout);
   botTimers.delete(botId);
 }
 
@@ -375,39 +379,217 @@ function startMovementLoop(bot, botNumber) {
   movementLoop();
 }
 
-// Create new bot with connection throttling
 // ---------------------------------------------------------------------------
-// Full player-like AI: movement + breaking + placing + sprint + chat
+// Opt-in mining mode: gathers a whitelisted set of block types inside a
+// rectangular zone you define. Off by default per bot. Never digs outside
+// the configured zone and never touches blocks not on the whitelist.
 // ---------------------------------------------------------------------------
+function inZone(pos, corner1, corner2) {
+  const minX = Math.min(corner1.x, corner2.x), maxX = Math.max(corner1.x, corner2.x);
+  const minY = Math.min(corner1.y, corner2.y), maxY = Math.max(corner1.y, corner2.y);
+  const minZ = Math.min(corner1.z, corner2.z), maxZ = Math.max(corner1.z, corner2.z);
+  return pos.x >= minX && pos.x <= maxX &&
+         pos.y >= minY && pos.y <= maxY &&
+         pos.z >= minZ && pos.z <= maxZ;
+}
 
+function findNextMiningTarget(bot, cfg) {
+  const { Vec3 } = require('vec3');
+  const minX = Math.min(cfg.corner1.x, cfg.corner2.x), maxX = Math.max(cfg.corner1.x, cfg.corner2.x);
+  const minY = Math.min(cfg.corner1.y, cfg.corner2.y), maxY = Math.max(cfg.corner1.y, cfg.corner2.y);
+  const minZ = Math.min(cfg.corner1.z, cfg.corner2.z), maxZ = Math.max(cfg.corner1.z, cfg.corner2.z);
+
+  // Search blocks near the bot first, within the configured zone only.
+  const candidates = bot.findBlocks({
+    matching: (block) => block && cfg.blocks.includes(block.name),
+    maxDistance: 48,
+    count: 20
+  }) || [];
+
+  for (const pos of candidates) {
+    if (pos.x >= minX && pos.x <= maxX &&
+        pos.y >= minY && pos.y <= maxY &&
+        pos.z >= minZ && pos.z <= maxZ) {
+      return bot.blockAt(pos);
+    }
+  }
+  return null;
+}
+
+// Check whether the bot currently has a tool capable of harvesting a drop
+// from this block. Mining ores with the wrong tool (or bare hands) either
+// fails to break the block or breaks it with no drop, so we skip those
+// instead of wasting time "mining" nothing.
+function hasRequiredTool(bot, block) {
+  try {
+    const mcData = require('minecraft-data')(bot.version || "1.20.1");
+    const blockData = mcData.blocksByName[block.name];
+    if (!blockData || !blockData.harvestTools) {
+      // Block has no tool restriction (e.g. dirt, sand) - anything works
+      return { ok: true };
+    }
+
+    const requiredToolIds = Object.keys(blockData.harvestTools).map(id => parseInt(id));
+    const inventory = bot.inventory.items();
+
+    for (const item of inventory) {
+      if (requiredToolIds.includes(item.type)) {
+        return { ok: true, tool: item };
+      }
+    }
+
+    // Build a readable list of acceptable tool names for logging
+    const acceptableNames = requiredToolIds
+      .map(id => mcData.items[id]?.name)
+      .filter(Boolean);
+
+    return { ok: false, needs: acceptableNames };
+  } catch (e) {
+    // If we can't determine requirements, don't block mining on an unknown error
+    return { ok: true };
+  }
+}
+
+function startMiningLoop(bot, botNumber) {
+  const timers = getTimerBucket(botNumber);
+
+  function loop() {
+    const cfg = botMiningConfig.get(botNumber);
+
+    // Stop the loop entirely if mining was disabled or the bot has no zone set
+    if (!cfg || !cfg.enabled || !cfg.corner1 || !cfg.corner2 || !cfg.blocks || cfg.blocks.length === 0) {
+      return; // don't reschedule - restarted explicitly when mining is re-enabled
+    }
+
+    if (!bot.entity || bot.combatMode) {
+      timers.miningTimeout = setTimeout(loop, 3000);
+      return;
+    }
+
+    const target = findNextMiningTarget(bot, cfg);
+    if (!target) {
+      addGameLog(`⛏️ No target blocks found in zone right now, retrying...`, botNumber);
+      timers.miningTimeout = setTimeout(loop, 5000);
+      return;
+    }
+
+    // Never dig outside the zone, double check even though findNextMiningTarget filters
+    if (!inZone(target.position, cfg.corner1, cfg.corner2)) {
+      timers.miningTimeout = setTimeout(loop, 3000);
+      return;
+    }
+
+    if (!bot.canDigBlock(target)) {
+      timers.miningTimeout = setTimeout(loop, 3000);
+      return;
+    }
+
+    const goals_ = require('mineflayer-pathfinder').goals;
+    const goal = new goals_.GoalGetToBlock(target.position.x, target.position.y, target.position.z);
+
+    if (bot.pathfinder) {
+      bot.pathfinder.setGoal(goal);
+    }
+
+    // Give pathfinder time to arrive, then attempt the dig
+    timers.miningTimeout = setTimeout(() => {
+      const cfgNow = botMiningConfig.get(botNumber);
+      if (!cfgNow || !cfgNow.enabled) return;
+      if (!bot.entity || bot.combatMode) {
+        timers.miningTimeout = setTimeout(loop, 3000);
+        return;
+      }
+
+      const blockNow = bot.blockAt(target.position);
+      if (!blockNow || !cfgNow.blocks.includes(blockNow.name) || !inZone(blockNow.position, cfgNow.corner1, cfgNow.corner2)) {
+        timers.miningTimeout = setTimeout(loop, 2000);
+        return;
+      }
+
+      const dist = bot.entity.position.distanceTo(blockNow.position);
+      if (dist > 5) {
+        // Still traveling, check again shortly
+        timers.miningTimeout = setTimeout(loop, 2000);
+        return;
+      }
+
+      const toolCheck = hasRequiredTool(bot, blockNow);
+      if (!toolCheck.ok) {
+        addGameLog(`🔧 Skipping ${blockNow.name} - need one of: ${toolCheck.needs.join(', ')}`, botNumber);
+        timers.miningTimeout = setTimeout(loop, 4000);
+        return;
+      }
+
+      const tool = getBestToolForBlock(blockNow.name, bot);
+      const equipPromise = tool ? bot.equip(tool, 'hand').catch(() => {}) : Promise.resolve();
+
+      equipPromise.then(() => {
+        bot.dig(blockNow, (err) => {
+          if (err) {
+            addGameLog(`⛏️ Dig error: ${err.message}`, botNumber);
+          } else {
+            addGameLog(`⛏️ Mined ${blockNow.name}`, botNumber);
+          }
+          timers.miningTimeout = setTimeout(loop, 1500 + Math.random() * 1500);
+        });
+      });
+    }, 4000);
+  }
+
+  loop();
+}
+
+function stopMiningLoop(botId) {
+  const timers = botTimers.get(botId);
+  if (timers && timers.miningTimeout) {
+    clearTimeout(timers.miningTimeout);
+    timers.miningTimeout = null;
+  }
+}
+
+// Create new bot with connection throttling
 function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, customUUID = null) {
   if (removedBots.has(botNumber)) {
     console.log(`[BOT ${botNumber}] This bot was manually removed. Not recreating.`);
     return null;
   }
+
+  // Check if bot is manually stopped
   if (botControlStates.get(botNumber) === 'STOPPED') {
     addGameLog(`⏸️ Bot ${botNumber} is manually stopped. Not connecting.`, botNumber);
     return null;
   }
+
+  // Check global leave mode
   if (globalLeaveMode) {
     addGameLog(`🌍 Skipping connection due to global leave mode`, botNumber);
+
+    // Schedule reconnect after global leave ends
     setTimeout(() => {
       if (!globalLeaveMode && !removedBots.has(botNumber)) {
         const controlState = botControlStates.get(botNumber);
-        if (controlState !== 'STOPPED') createNewBot(botNumber, false);
+        if (controlState !== 'STOPPED') {
+          createNewBot(botNumber, false);
+        }
       }
-    }, 61000);
+    }, 61000); // Slightly more than 1 minute
+
     return null;
   }
 
-  const botDataExisting = allBots.get(botNumber);
-  if (botDataExisting && botDataExisting.reconnectAttempts > 3) {
-    const timeSinceLastAttempt = Date.now() - botDataExisting.lastReconnectAttempt;
-    if (timeSinceLastAttempt < 30000) {
+  // Check connection throttling
+  const botData = allBots.get(botNumber);
+  if (botData && botData.reconnectAttempts > 3) {
+    const timeSinceLastAttempt = Date.now() - botData.lastReconnectAttempt;
+    if (timeSinceLastAttempt < 30000) { // 30 seconds throttle
       const waitTime = Math.ceil((30000 - timeSinceLastAttempt) / 1000);
-      addGameLog(`⏳ Connection throttled for bot ${botNumber}. Wait ${waitTime}s.`, botNumber);
+      addGameLog(`⏳ Connection throttled for bot ${botNumber}. Please wait ${waitTime}s before reconnect.`, botNumber);
+
+      // Schedule reconnect after throttle period
       setTimeout(() => {
-        if (!removedBots.has(botNumber)) createNewBot(botNumber, false);
+        if (!removedBots.has(botNumber)) {
+          createNewBot(botNumber, false);
+        }
       }, 30000 - timeSinceLastAttempt);
       return null;
     }
@@ -419,6 +601,8 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
   } else {
     identity = getBotIdentity(botNumber);
   }
+
+  // Validate custom name length
   if (customName && customName.length < 4) {
     addGameLog(`❌ Custom name must be at least 4 characters: ${customName}`, botNumber);
     return null;
@@ -426,6 +610,7 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
 
   const botName = identity.name;
   const botUUID = identity.uuid;
+
   addGameLog(`🔗 Connecting as ${botName}`, botNumber);
 
   const bot = mineflayer.createBot({
@@ -435,8 +620,10 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     uuid: botUUID,
     version: config.server.version || "1.20.1",
     auth: "offline",
-    checkTimeoutInterval: 120000,
-    hideErrors: false    // show connection errors while testing
+    checkTimeoutInterval: 120000,   // 2 minutes (internal mineflayer timeout)
+    keepAlive: true,                // send frequent keep-alive packets to server
+    keepAliveInterval: 5000,        // send every 5 seconds
+    hideErrors: true
   });
 
   bot.botId = botNumber;
@@ -450,43 +637,33 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
   bot.combatMode = false;
   bot.controlState = botControlStates.get(botNumber) || 'RUNNING';
 
+  // Update bot data in allBots map
   allBots.set(botNumber, {
     bot: bot,
     online: false,
     lastSeen: new Date().toISOString(),
     status: 'connecting',
-    reconnectAttempts: botDataExisting ? botDataExisting.reconnectAttempts + 1 : 1,
+    reconnectAttempts: botData ? botData.reconnectAttempts + 1 : 1,
     lastReconnectAttempt: Date.now(),
     health: 20,
     food: 20,
     controlState: bot.controlState
   });
 
-  // Load plugins
+  let defaultMove = null;
+
   bot.on('inject_allowed', () => {
     const mcData = require('minecraft-data')(bot.version || "1.20.1");
     if (mcData) {
       bot.loadPlugin(pathfinder);
       bot.loadPlugin(pvp);
-      const defaultMove = new Movements(bot, mcData);
+      defaultMove = new Movements(bot, mcData);
       defaultMove.canDig = false;
       defaultMove.allow1by1towers = false;
       bot.pathfinder.setMovements(defaultMove);
-
-      // Auto-eat plugin (requires npm install mineflayer-auto-eat)
-      try {
-        bot.loadPlugin(require('mineflayer-auto-eat').plugin);
-        bot.autoEat.options.priority = 'foodPoints';
-        bot.autoEat.options.bannedFood = [];
-        bot.autoEat.options.eatingTimeout = 3;
-        bot.autoEat.enable();
-      } catch (e) {
-        console.log('[AUTO-EAT] Plugin not found (run npm install mineflayer-auto-eat)');
-      }
     }
   });
 
-  // ==================== SPAWN ====================
   bot.once('spawn', () => {
     addGameLog(`✅ Spawned in world.`, botNumber);
 
@@ -494,106 +671,96 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     if (botData) {
       botData.online = true;
       botData.status = 'online';
-      botData.reconnectAttempts = 0;
+      botData.reconnectAttempts = 0; // Reset reconnect attempts on successful connection
     }
 
     bot.settings.colorsEnabled = false;
 
+    // Update health and food
     bot.on('health', () => {
-      const bd = allBots.get(botNumber);
-      if (bd) bd.health = bot.health;
+      const botData = allBots.get(botNumber);
+      if (botData) {
+        botData.health = bot.health;
+        botData.food = bot.food;
+      }
     });
 
-    // --- NATURAL ANTI-AFK MOVEMENT (your improved version) ---
+    // Natural anti-AFK movement
     const timers = getTimerBucket(botNumber);
     if (config.utils["anti-afk"] !== false) {
       startMovementLoop(bot, botNumber);
     }
 
-    // --- OPTIONAL CHAT HEARTBEAT (every 5-10 minutes) ---
+    // Opt-in mining mode - only runs if explicitly enabled for this bot via the API
+    const miningCfg = botMiningConfig.get(botNumber);
+    if (miningCfg && miningCfg.enabled) {
+      startMiningLoop(bot, botNumber);
+    }
+
+    // Optional heartbeat chat to prevent idle kicks
     if (config.utils["chat-heartbeat"] !== false) {
       timers.heartbeatInterval = setInterval(() => {
         safeChat(bot, '/help');
-      }, 300000 + Math.random() * 300000);
+      }, 60000 + Math.random() * 60000);
     }
 
-    // --- BLOCK INTERACTION + PLAYER ACTIONS ---
-    // Runs every 2-5 seconds, performing human-like world interactions
-    let actionInterval;
-    function scheduleAction() {
-      if (!bot?.entity || bot.combatMode) {
-        actionInterval = setTimeout(scheduleAction, 3000);
-        return;
-      }
-      const actions = [
-        'breakBlock',
-        'placeBlock',
-        'sprintJump',
-        'sneak',
-        'idleChat',
-        'lookAround'
-      ];
-      const action = actions[Math.floor(Math.random() * actions.length)];
-      try {
-        switch (action) {
-          case 'breakBlock': tryBreakBlock(bot); break;
-          case 'placeBlock': tryPlaceBlock(bot); break;
-          case 'sprintJump':
-            bot.setControlState('sprint', true);
-            bot.setControlState('jump', true);
-            bot.setControlState('forward', true);
-            setTimeout(() => {
-              bot.setControlState('sprint', false);
-              bot.setControlState('jump', false);
-              bot.setControlState('forward', false);
-            }, 1500);
-            break;
-          case 'sneak':
-            bot.setControlState('sneak', true);
-            setTimeout(() => bot.setControlState('sneak', false), 1200);
-            break;
-          case 'idleChat':
-            const phrases = ['Hello!', 'Nice day.', 'How are you?', 'Good game.', 'Lol', 'GG', 'Cool house.', 'Anyone here?'];
-            safeChat(bot, phrases[Math.floor(Math.random() * phrases.length)]);
-            break;
-          case 'lookAround':
-            bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI / 2 - Math.PI / 4);
-            bot.swingArm('right');
-            break;
-        }
-      } catch (e) {}
-      actionInterval = setTimeout(scheduleAction, 2000 + Math.random() * 3000);
-    }
-    scheduleAction();
-
-    // --- COMBAT AI (unchanged) ---
+    // Combat AI - Only attacks when attacked first
     bot.on('entityHurt', (entity) => {
       if (entity !== bot.entity) return;
+
       const damageEvents = Object.values(bot.entity.damageHistory || {});
       if (damageEvents.length === 0) return;
+
       const recentDamage = damageEvents[damageEvents.length - 1];
       const attacker = recentDamage.attacker;
+
+      // Only attack if a player attacked first and we don't already have a target
       if (attacker && attacker.type === 'player' && !bot.lockedTarget) {
         bot.lockedTarget = attacker;
         bot.combatMode = true;
         bot.lastAttackTime = Date.now();
+
         const attackerName = attacker.username || 'Unknown';
-        botTargets.set(botNumber, { targetPlayer: attackerName, lastMessageTime: Date.now() });
+
+        // Store target
+        botTargets.set(botNumber, {
+          targetPlayer: attackerName,
+          lastMessageTime: Date.now()
+        });
+
+        // Send mocking message
         const message = getMockingMessage(attackerName);
-        setTimeout(() => { if (bot.entity) safeChat(bot, message); }, 1000);
-        addGameLog(`🔒 Locked on ${attackerName}!`, botNumber);
-        const weapons = bot.inventory.items().filter(item => item.name.includes('sword') || item.name.includes('axe'));
+        setTimeout(() => {
+          if (bot.entity) {
+            safeChat(bot, message);
+            addGameLog(`🗣️ "${message}"`, botNumber);
+          }
+        }, 1000);
+
+        addGameLog(`🔒 Locked on ${attackerName}! Combat mode activated.`, botNumber);
+
+        // Auto equip best weapon
+        const weapons = bot.inventory.items().filter(item =>
+          item.name.includes('sword') || item.name.includes('axe')
+        );
+
         if (weapons.length > 0) {
           const bestWeapon = weapons.reduce((best, item) => {
             const damage = getWeaponDamage(item.name);
             return damage > best.damage ? { item, damage } : best;
           }, { item: null, damage: 0 });
-          if (bestWeapon.item) bot.equip(bestWeapon.item, 'hand').catch(() => {});
+
+          if (bestWeapon.item) {
+            bot.equip(bestWeapon.item, 'hand').catch(() => {});
+          }
         }
+
+        // Start combat routine
         startCombatRoutine(bot, botNumber);
       }
     });
 
+    // Clear target on death
     bot.on('death', () => {
       addGameLog(`☠️ Bot died.`, botNumber);
       bot.combatMode = false;
@@ -602,100 +769,164 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       if (bot.pvp) bot.pvp.stop();
     });
 
-    // --- CHAT & PLAYER EVENTS (unchanged) ---
+    // Chat logging with "bot leave" command detection
     bot.on('chat', (username, message) => {
       if (username !== bot.username) {
         addGameLog(`💬 <${username}> ${message}`, botNumber);
-        if (message.toLowerCase().includes('bot leave')) activateGlobalLeave();
-      }
-      if (message.toLowerCase().includes('was killed') || message.toLowerCase().includes('slain') || message.toLowerCase().includes('died'))
-        addGameLog(`💀 ${message}`, botNumber);
-      if (message.toLowerCase().includes('joined') || message.toLowerCase().includes('left') || message.toLowerCase().includes('achievement') || message.toLowerCase().includes('advancement'))
-        addGameLog(`📢 ${message}`, botNumber);
-    });
-    bot.on('playerJoined', (player) => { if (player.username !== bot.username) addGameLog(`➡️ ${player.username} joined`, botNumber); });
-    bot.on('playerLeft', (player) => { if (player.username !== bot.username) addGameLog(`⬅️ ${player.username} left`, botNumber); });
 
-    // AUTH & join-command
+        // Check for global leave command (case insensitive)
+        if (message.toLowerCase().includes('bot leave')) {
+          activateGlobalLeave();
+        }
+      }
+
+      if (message.toLowerCase().includes('was killed') ||
+          message.toLowerCase().includes('slain') ||
+          message.toLowerCase().includes('died')) {
+        addGameLog(`💀 ${message}`, botNumber);
+      }
+
+      if (message.toLowerCase().includes('joined') ||
+          message.toLowerCase().includes('left') ||
+          message.toLowerCase().includes('achievement') ||
+          message.toLowerCase().includes('advancement')) {
+        addGameLog(`📢 ${message}`, botNumber);
+      }
+    });
+
+    // Player join/leave events
+    bot.on('playerJoined', (player) => {
+      if (player.username !== bot.username) {
+        addGameLog(`➡️ ${player.username} joined the game`, botNumber);
+      }
+    });
+
+    bot.on('playerLeft', (player) => {
+      if (player.username !== bot.username) {
+        addGameLog(`⬅️ ${player.username} left the game`, botNumber);
+      }
+    });
+
+    // AUTH SEQUENCE
     if (config.utils["auto-auth"]?.enabled) {
       const pass = config.utils["auto-auth"].password;
+
       setTimeout(() => {
         safeChat(bot, `/register ${pass} ${pass}`);
+
         setTimeout(() => {
           safeChat(bot, `/login ${pass}`);
-          if (config.utils["join-command"]?.enabled) setTimeout(() => safeChat(bot, config.utils["join-command"].command), 2000);
+
+          if (config.utils["join-command"]?.enabled) {
+            const cmd = config.utils["join-command"].command;
+            setTimeout(() => {
+              safeChat(bot, cmd);
+            }, 2000);
+          }
         }, 2000);
       }, 2000);
     } else if (config.utils["join-command"]?.enabled) {
-      setTimeout(() => safeChat(bot, config.utils["join-command"].command), 4000);
+      const cmd = config.utils["join-command"].command;
+      setTimeout(() => {
+        safeChat(bot, cmd);
+      }, 4000);
     }
   });
 
-  // ==================== HELPER: BREAK BLOCK ====================
-  function tryBreakBlock(bot) {
-    const block = bot.blockAtCursor(5);
-    if (block && bot.canDigBlock(block)) {
-      const tool = getBestToolForBlock(block.name, bot);
-      if (tool) bot.equip(tool, 'hand').catch(() => {});
-      bot.dig(block, (err) => {
-        if (err) console.log(`Dig error: ${err.message}`);
-      });
-    }
-  }
-
-  // ==================== HELPER: PLACE BLOCK ====================
-  function tryPlaceBlock(bot) {
-    const block = bot.inventory.items().find(item => 
-      item.name.includes('dirt') || item.name.includes('cobblestone') || item.name.includes('planks')
-    );
-    if (!block) return;
-    bot.equip(block, 'hand').catch(() => {});
-    const refBlock = bot.blockAtCursor(5);
-    if (refBlock) {
-      // Vec3 is required
-      const { Vec3 } = require('vec3');
-      bot.placeBlock(refBlock, new Vec3(0, 1, 0), (err) => {
-        if (err) console.log(`Place error: ${err.message}`);
-      });
-    }
-  }
-
-  // ==================== KICK / ERROR / RECONNECT (unchanged) ====================
+  // KICK HANDLING - Bot stays in list
   bot.on('kicked', (reason) => {
     const kickMsg = typeof reason === 'string' ? reason : JSON.stringify(reason);
     bot.lastKickReason = kickMsg;
+
     addGameLog(`🚫 Kicked: ${kickMsg.substring(0, 100)}`, botNumber);
+
     clearBotTimers(botNumber);
-    const bd = allBots.get(botNumber);
-    if (bd) { bd.online = false; bd.status = 'kicked'; bd.lastSeen = new Date().toISOString(); bd.lastReconnectAttempt = Date.now(); }
-    const isBan = kickMsg.toLowerCase().includes("ban") || kickMsg.toLowerCase().includes("banned") || kickMsg.toLowerCase().includes("permanent") || kickMsg.toLowerCase().includes("blacklist") || kickMsg.toLowerCase().includes("hacking") || kickMsg.toLowerCase().includes("cheat");
-    if (isBan) { bot.isBanned = true; generateNewIdentity(botNumber); }
-    else bot.isBanned = false;
+
+    // Update bot status
+    const botData = allBots.get(botNumber);
+    if (botData) {
+      botData.online = false;
+      botData.status = 'kicked';
+      botData.lastSeen = new Date().toISOString();
+      botData.lastReconnectAttempt = Date.now();
+    }
+
+    const isBan = kickMsg.toLowerCase().includes("ban") ||
+                  kickMsg.toLowerCase().includes("banned") ||
+                  kickMsg.toLowerCase().includes("permanent") ||
+                  kickMsg.toLowerCase().includes("blacklist") ||
+                  kickMsg.toLowerCase().includes("hacking") ||
+                  kickMsg.toLowerCase().includes("cheat");
+
+    if (isBan) {
+      addGameLog(`🔨 BAN detected! Generating new identity...`, botNumber);
+      bot.isBanned = true;
+      generateNewIdentity(botNumber);
+    } else {
+      addGameLog(`Regular kick. Will reconnect with same identity.`, botNumber);
+      bot.isBanned = false;
+    }
   });
 
   bot.on('error', (err) => {
     addGameLog(`❌ Error: ${err.message}`, botNumber);
+
     clearBotTimers(botNumber);
-    const bd = allBots.get(botNumber);
-    if (bd) { bd.online = false; bd.status = 'error'; bd.lastSeen = new Date().toISOString(); bd.lastReconnectAttempt = Date.now(); }
+
+    // Update bot status
+    const botData = allBots.get(botNumber);
+    if (botData) {
+      botData.online = false;
+      botData.status = 'error';
+      botData.lastSeen = new Date().toISOString();
+      botData.lastReconnectAttempt = Date.now();
+    }
   });
 
+  // AUTO-RECONNECT with throttle
   bot.on('end', () => {
     clearBotTimers(botNumber);
-    const bd = allBots.get(botNumber);
-    if (bd) { bd.online = false; bd.status = 'disconnected'; bd.lastSeen = new Date().toISOString(); }
-    if (botControlStates.get(botNumber) === 'STOPPED') return;
-    if (bot.manuallyRemoved || removedBots.has(botNumber) || !config.utils["auto-reconnect"]) return;
+
+    // Update bot status
+    const botData = allBots.get(botNumber);
+    if (botData) {
+      botData.online = false;
+      botData.status = 'disconnected';
+      botData.lastSeen = new Date().toISOString();
+    }
+
+    // Check if manually stopped
+    if (botControlStates.get(botNumber) === 'STOPPED') {
+      addGameLog(`⏸️ Bot ${botNumber} is manually stopped. No auto-reconnect.`, botNumber);
+      return;
+    }
+
+    if (bot.manuallyRemoved) {
+      addGameLog(`Bot ${botNumber} was manually removed. No auto-reconnect.`, botNumber);
+      return;
+    }
+
+    if (!config.utils["auto-reconnect"]) {
+      addGameLog(`Auto-reconnect disabled for bot ${botNumber}`, botNumber);
+      return;
+    }
+
+    if (removedBots.has(botNumber)) {
+      return;
+    }
+
     const delay = config.utils["auto-reconnect-delay"] || 15000;
-    addGameLog(`Reconnecting in ${delay/1000}s...`, botNumber);
-    setTimeout(() => { if (!removedBots.has(botNumber)) createNewBot(botNumber, false); }, delay);
+    addGameLog(`Reconnecting bot ${botNumber} in ${delay/1000}s...`, botNumber);
+
+    setTimeout(() => {
+      if (!removedBots.has(botNumber)) {
+        createNewBot(botNumber, false);
+      }
+    }, delay);
   });
 
   return bot;
 }
-
-    // Check if manually stopped
-
 
 // Helper functions
 function getWeaponDamage(itemName) {
@@ -868,6 +1099,7 @@ app.get('/', (req, res) => {
         <div class="tabs">
           <button class="tab active" onclick="switchTab('dashboard')">🏠 Dashboard</button>
           <button class="tab" onclick="switchTab('bots')">🤖 Bots</button>
+          <button class="tab" onclick="switchTab('mining')">⛏️ Mining</button>
           <button class="tab" onclick="switchTab('console')">📟 Console</button>
           <button class="tab" onclick="switchTab('server')">🌐 Server</button>
         </div>
@@ -952,6 +1184,47 @@ app.get('/', (req, res) => {
             </div>
           </div>
 
+          <!-- Mining Tab -->
+          <div class="tab-content" id="miningTab">
+            <div class="card">
+              <h3 style="margin-bottom: 1rem;">Mining Zone Setup</h3>
+              <div class="form-section">
+                <h4>Select Bot</h4>
+                <select id="miningBotSelect">
+                  <!-- populated dynamically -->
+                </select>
+              </div>
+              <div class="form-section">
+                <h4>Zone Corner 1</h4>
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem;">
+                  <input type="number" id="miningC1X" placeholder="X">
+                  <input type="number" id="miningC1Y" placeholder="Y">
+                  <input type="number" id="miningC1Z" placeholder="Z">
+                </div>
+              </div>
+              <div class="form-section">
+                <h4>Zone Corner 2</h4>
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem;">
+                  <input type="number" id="miningC2X" placeholder="X">
+                  <input type="number" id="miningC2Y" placeholder="Y">
+                  <input type="number" id="miningC2Z" placeholder="Z">
+                </div>
+              </div>
+              <div class="form-section">
+                <h4>Target Blocks (comma separated)</h4>
+                <input type="text" id="miningBlocks" placeholder="coal_ore, iron_ore, deepslate_iron_ore">
+              </div>
+              <button class="btn btn-success" onclick="saveMiningConfig()">Save Zone</button>
+            </div>
+
+            <div class="card">
+              <h3 style="margin-bottom: 1rem;">Mining Status</h3>
+              <div id="miningStatusList">
+                <!-- populated dynamically -->
+              </div>
+            </div>
+          </div>
+
           <!-- Console Tab -->
           <div class="tab-content" id="consoleTab">
             <div class="card" style="flex: 1; display: flex; flex-direction: column;">
@@ -1025,6 +1298,8 @@ app.get('/', (req, res) => {
           updateFullConsole();
           updateServerHistory();
           updateBotDropdown();
+          updateMiningBotSelect();
+          updateMiningStatus();
         }
 
         function updateStats() {
@@ -1427,6 +1702,136 @@ app.get('/', (req, res) => {
         document.getElementById('targetBot').addEventListener('change', function() {
           selectedBotId = this.value;
         });
+
+        // ---- Mining tab ----
+        let miningBotListCache = [];
+
+        function updateMiningBotSelect() {
+          fetch('/api/bots')
+            .then(res => res.json())
+            .then(data => {
+              miningBotListCache = data.bots;
+              const select = document.getElementById('miningBotSelect');
+              const prevValue = select.value;
+              select.innerHTML = '';
+
+              if (data.bots.length === 0) {
+                select.innerHTML = '<option value="">No bots created yet</option>';
+                return;
+              }
+
+              data.bots.sort((a, b) => a.id - b.id).forEach(bot => {
+                const option = document.createElement('option');
+                option.value = bot.id;
+                option.textContent = \`Bot \${bot.id}: \${bot.name}\`;
+                select.appendChild(option);
+              });
+
+              if (prevValue && [...select.options].some(o => o.value === prevValue)) {
+                select.value = prevValue;
+              }
+            });
+        }
+
+        function saveMiningConfig() {
+          const botId = document.getElementById('miningBotSelect').value;
+          if (!botId) {
+            alert('Add a bot first!');
+            return;
+          }
+
+          const c1x = parseInt(document.getElementById('miningC1X').value);
+          const c1y = parseInt(document.getElementById('miningC1Y').value);
+          const c1z = parseInt(document.getElementById('miningC1Z').value);
+          const c2x = parseInt(document.getElementById('miningC2X').value);
+          const c2y = parseInt(document.getElementById('miningC2Y').value);
+          const c2z = parseInt(document.getElementById('miningC2Z').value);
+
+          if ([c1x, c1y, c1z, c2x, c2y, c2z].some(v => Number.isNaN(v))) {
+            alert('Please fill in all X/Y/Z fields for both corners!');
+            return;
+          }
+
+          const blocksRaw = document.getElementById('miningBlocks').value.trim();
+          if (!blocksRaw) {
+            alert('Please enter at least one target block name!');
+            return;
+          }
+          const blocks = blocksRaw.split(',').map(b => b.trim()).filter(b => b.length > 0);
+
+          fetch(\`/api/bot/\${botId}/mining/config\`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              corner1: { x: c1x, y: c1y, z: c1z },
+              corner2: { x: c2x, y: c2y, z: c2z },
+              blocks: blocks
+            })
+          }).then(res => res.json())
+            .then(data => {
+              if (data.success) {
+                alert('Mining zone saved! Toggle it on from the status list below.');
+                updateMiningStatus();
+              } else {
+                alert('Error: ' + (data.error || 'Failed to save zone'));
+              }
+            });
+        }
+
+        function toggleMining(botId) {
+          fetch(\`/api/bot/\${botId}/mining/toggle\`, { method: 'POST' })
+            .then(res => res.json())
+            .then(data => {
+              if (!data.success) {
+                alert('Error: ' + (data.error || 'Set a zone and blocks first'));
+              }
+              updateMiningStatus();
+            });
+        }
+
+        function updateMiningStatus() {
+          if (miningBotListCache.length === 0) {
+            document.getElementById('miningStatusList').innerHTML =
+              '<div style="text-align: center; color: #94a3b8; padding: 1rem;">No bots created yet</div>';
+            return;
+          }
+
+          const requests = miningBotListCache.map(bot =>
+            fetch(\`/api/bot/\${bot.id}/mining/config\`).then(res => res.json()).then(data => ({ bot, config: data.config }))
+          );
+
+          Promise.all(requests).then(results => {
+            const listDiv = document.getElementById('miningStatusList');
+            listDiv.innerHTML = '';
+
+            results.sort((a, b) => a.bot.id - b.bot.id).forEach(({ bot, config }) => {
+              const item = document.createElement('div');
+              item.className = 'bot-item';
+
+              let zoneText = 'No zone set';
+              let enabledText = '';
+              if (config && config.corner1 && config.corner2) {
+                zoneText = \`(\${config.corner1.x}, \${config.corner1.y}, \${config.corner1.z}) → (\${config.corner2.x}, \${config.corner2.y}, \${config.corner2.z})\`;
+                enabledText = config.enabled ? '⛏️ Mining ON' : '⏸️ Mining OFF';
+              }
+
+              item.innerHTML = \`
+                <div class="bot-info">
+                  <div class="bot-name">Bot \${bot.id}: \${bot.name}</div>
+                  <div class="bot-status">\${zoneText}\${enabledText ? ' | ' + enabledText : ''}</div>
+                </div>
+                <div class="bot-controls">
+                  <button class="bot-control-btn \${config && config.enabled ? 'bot-stop' : 'bot-resume'}"
+                    onclick="toggleMining(\${bot.id})"
+                    \${!config || !config.corner1 ? 'disabled' : ''}>
+                    \${config && config.enabled ? 'Stop' : 'Start'}
+                  </button>
+                </div>
+              \`;
+              listDiv.appendChild(item);
+            });
+          });
+        }
       </script>
     </body>
     </html>
@@ -1635,6 +2040,63 @@ app.post('/api/bot/:id/toggle', (req, res) => {
   }
 
   res.json({ success, botId, state: newState });
+});
+
+// Mining zone/config endpoints - opt-in, off by default, scoped to a rectangle
+app.post('/api/bot/:id/mining/config', (req, res) => {
+  const botId = parseInt(req.params.id);
+  const { corner1, corner2, blocks } = req.body;
+
+  if (!corner1 || !corner2 || typeof corner1.x !== 'number' || typeof corner2.x !== 'number') {
+    return res.json({ success: false, error: 'corner1 and corner2 with x,y,z are required' });
+  }
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return res.json({ success: false, error: 'blocks must be a non-empty array of block names' });
+  }
+
+  const existing = botMiningConfig.get(botId) || { enabled: false };
+  botMiningConfig.set(botId, {
+    enabled: existing.enabled || false,
+    corner1: { x: corner1.x, y: corner1.y, z: corner1.z },
+    corner2: { x: corner2.x, y: corner2.y, z: corner2.z },
+    blocks: blocks
+  });
+
+  addGameLog(`[WEB] Mining zone set for bot ${botId}: ${JSON.stringify(corner1)} to ${JSON.stringify(corner2)}, blocks: ${blocks.join(', ')}`);
+  res.json({ success: true, config: botMiningConfig.get(botId) });
+});
+
+app.post('/api/bot/:id/mining/toggle', (req, res) => {
+  const botId = parseInt(req.params.id);
+  const cfg = botMiningConfig.get(botId);
+
+  if (!cfg || !cfg.corner1 || !cfg.corner2 || !cfg.blocks || cfg.blocks.length === 0) {
+    return res.json({ success: false, error: 'Set a mining zone and block list first via /api/bot/:id/mining/config' });
+  }
+
+  cfg.enabled = !cfg.enabled;
+  botMiningConfig.set(botId, cfg);
+
+  const botData = allBots.get(botId);
+  if (cfg.enabled) {
+    addGameLog(`⛏️ Mining mode ENABLED for bot ${botId}`, botId);
+    if (botData && botData.bot && botData.online) {
+      startMiningLoop(botData.bot, botId);
+    }
+  } else {
+    addGameLog(`⛏️ Mining mode DISABLED for bot ${botId}`, botId);
+    stopMiningLoop(botId);
+    if (botData && botData.bot && botData.bot.pathfinder) {
+      try { botData.bot.pathfinder.setGoal(null); } catch (e) {}
+    }
+  }
+
+  res.json({ success: true, enabled: cfg.enabled });
+});
+
+app.get('/api/bot/:id/mining/config', (req, res) => {
+  const botId = parseInt(req.params.id);
+  res.json({ config: botMiningConfig.get(botId) || null });
 });
 
 app.post('/api/command', (req, res) => {
