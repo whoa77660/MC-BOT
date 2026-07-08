@@ -1653,6 +1653,29 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[WEB] Server running on port ${PORT}`);
   addGameLog(`[SYSTEM] Web server started on port ${PORT}`);
+
+  // Keep-alive: pings own Render URL every 49 seconds
+const KEEP_ALIVE_URL = process.env.RENDER_URL || "https://mc-bot-39ur.onrender.com/";
+const KEEP_ALIVE_INTERVAL = 49 * 1000;
+
+function keepAlive() {
+  const url = new URL(KEEP_ALIVE_URL);
+  const httpModule = url.protocol === 'https:' ? require('https') : require('http');
+
+  const req = httpModule.get(KEEP_ALIVE_URL, { timeout: 30000 }, (res) => {
+    console.log(`Self Ping: ${res.statusCode}`);
+    res.resume(); // consume response data to free up memory
+  });
+  req.on('error', (e) => {
+    console.log(`Self Ping Error: ${e.message}`);
+  });
+  req.on('timeout', () => {
+    req.destroy();
+    console.log('Self Ping Timeout');
+  });
+}
+
+setInterval(keepAlive, KEEP_ALIVE_INTERVAL);
   
   const initialBots = config.botAccount?.initialCount || 1;
   if (initialBots > 0) {
