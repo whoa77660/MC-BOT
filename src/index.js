@@ -28,11 +28,6 @@ let allBots = new Map(); // botId -> {bot, online, lastSeen, status, reconnectAt
 let botTargets = new Map(); // botId -> {targetPlayer, lastMessageTime}
 // Store bot control states
 let botControlStates = new Map(); // botId -> 'RUNNING' | 'STOPPED'
-// Track active timers/intervals per bot so we can clean them up on disconnect
-let botTimers = new Map(); // botId -> { movementTimeout, heartbeatInterval, combatInterval, miningTimeout }
-// Mining mode config per bot: { enabled, corner1: {x,y,z}, corner2: {x,y,z}, blocks: [names] }
-// Mining is OFF by default and only runs when explicitly enabled via the API for a given bot.
-let botMiningConfig = new Map(); // botId -> { enabled, corner1, corner2, blocks }
 // Global leave mode
 let globalLeaveMode = false;
 let globalLeaveTimeout = null;
@@ -41,11 +36,11 @@ let globalLeaveTimeout = null;
 function generateNewIdentity(botId = null, customName = null, customUUID = null) {
   const name = customName || "Player_" + Math.floor(Math.random() * 999999);
   const uuid = customUUID || uuidv4();
-
+  
   if (botId !== null) {
     botIdentities.set(botId, { name, uuid });
   }
-
+  
   console.log(`[IDENTITY] New identity: ${name}`);
   return { name, uuid };
 }
@@ -75,36 +70,15 @@ function getMockingMessage(playerName) {
   return messages[Math.floor(Math.random() * messages.length)];
 }
 
-// Helper: get or create the timer bucket for a bot
-function getTimerBucket(botId) {
-  if (!botTimers.has(botId)) {
-    botTimers.set(botId, { movementTimeout: null, heartbeatInterval: null, combatInterval: null });
-  }
-  return botTimers.get(botId);
-}
-
-// Helper: clear all timers for a bot (call on end/kick/error/manual stop)
-function clearBotTimers(botId) {
-  const timers = botTimers.get(botId);
-  if (!timers) return;
-  if (timers.movementTimeout) clearTimeout(timers.movementTimeout);
-  if (timers.heartbeatInterval) clearInterval(timers.heartbeatInterval);
-  if (timers.combatInterval) clearInterval(timers.combatInterval);
-  if (timers.miningTimeout) clearTimeout(timers.miningTimeout);
-  botTimers.delete(botId);
-}
-
 // Bot control functions
 function stopBot(botId) {
   const botData = allBots.get(botId);
   if (!botData) return false;
-
+  
   botControlStates.set(botId, 'STOPPED');
   botData.status = 'stopped';
   botData.controlState = 'STOPPED';
-
-  clearBotTimers(botId);
-
+  
   if (botData.bot) {
     botData.bot.controlState = 'STOPPED';
     if (botData.online) {
@@ -112,7 +86,7 @@ function stopBot(botId) {
       botData.online = false;
     }
   }
-
+  
   addGameLog(`⏸️ Bot ${botId} stopped (manual control)`, botId);
   return true;
 }
@@ -120,21 +94,18 @@ function stopBot(botId) {
 function startBot(botId) {
   const botData = allBots.get(botId);
   if (!botData) return false;
-
+  
   botControlStates.set(botId, 'RUNNING');
   botData.status = 'starting';
   botData.controlState = 'RUNNING';
-  // Reset throttle counters so a manual start isn't punished by prior failures
-  botData.reconnectAttempts = 0;
-  botData.lastReconnectAttempt = 0;
-
+  
   // Create new bot instance
   setTimeout(() => {
     if (!removedBots.has(botId)) {
       createNewBot(botId, false);
     }
   }, 2000);
-
+  
   addGameLog(`▶️ Bot ${botId} started (manual control)`, botId);
   return true;
 }
@@ -142,21 +113,21 @@ function startBot(botId) {
 // Global leave mode
 function activateGlobalLeave() {
   if (globalLeaveMode) return; // Already in leave mode
-
+  
   globalLeaveMode = true;
   addGameLog(`🌍 GLOBAL LEAVE MODE ACTIVATED - All bots leaving for 1 minute`);
-
+  
   // Make all running bots leave
   allBots.forEach((botData, botId) => {
     if (botData.online && botData.bot && botControlStates.get(botId) !== 'STOPPED') {
       const bot = botData.bot;
-      safeChat(bot, 'Leaving due to global command...');
+      bot.chat('Leaving due to global command...');
       setTimeout(() => {
-        try { bot.quit('Global leave command'); } catch (e) {}
+        bot.quit('Global leave command');
       }, Math.random() * 3000); // Stagger leaves
     }
   });
-
+  
   // Set timeout to disable global leave mode
   globalLeaveTimeout = setTimeout(() => {
     globalLeaveMode = false;
@@ -164,61 +135,49 @@ function activateGlobalLeave() {
   }, 60000); // 1 minute
 }
 
-// Safe chat wrapper so a bad send doesn't crash anything
-function safeChat(bot, message) {
-  try {
-    if (bot && bot.entity) bot.chat(message);
-  } catch (e) {
-    console.log(`[CHAT ERROR] ${e.message}`);
-  }
-}
-
 // Combat routine function
 function startCombatRoutine(bot, botNumber) {
   if (!bot.combatMode || !bot.lockedTarget) return;
-
-  const timers = getTimerBucket(botNumber);
-  if (timers.combatInterval) clearInterval(timers.combatInterval);
-
+  
   const combatInterval = setInterval(() => {
     if (!bot.entity || !bot.combatMode || !bot.lockedTarget) {
       clearInterval(combatInterval);
       return;
     }
-
+    
     const target = bot.lockedTarget;
     const targetData = botTargets.get(botNumber);
-
+    
     // Check if target is still valid
     if (!target.isValid || target.health <= 0) {
       // Target is dead or gone
       if (targetData) {
         const finalMessage = `${targetData.targetPlayer} has been dealt with!`;
-        safeChat(bot, finalMessage);
+        bot.chat(finalMessage);
         addGameLog(`🎯 Target eliminated: ${targetData.targetPlayer}`, botNumber);
         botTargets.delete(botNumber);
       }
-
+      
       bot.combatMode = false;
       bot.lockedTarget = null;
-      if (bot.pvp) bot.pvp.stop();
+      bot.pvp.stop();
       clearInterval(combatInterval);
       return;
     }
-
+    
     // Send occasional mocking messages (every 10-20 seconds)
     if (targetData && Date.now() - targetData.lastMessageTime > 10000 + Math.random() * 10000) {
       const message = getMockingMessage(targetData.targetPlayer);
-      safeChat(bot, message);
+      bot.chat(message);
       addGameLog(`🗣️ "${message}"`, botNumber);
       targetData.lastMessageTime = Date.now();
       botTargets.set(botNumber, targetData);
     }
-
+    
     // Attack if in range
     if (target.position.distanceTo(bot.entity.position) < 4) {
-      if (bot.pvp) bot.pvp.attack(target);
-
+      bot.pvp.attack(target);
+      
       // Simple dodging - move sideways randomly
       if (Math.random() > 0.5) {
         bot.setControlState('left', true);
@@ -229,12 +188,10 @@ function startCombatRoutine(bot, botNumber) {
       }
     } else {
       // Move towards target
-      if (bot.pathfinder) bot.pathfinder.setGoal(new goals.GoalFollow(target, 3));
+      bot.pathfinder.setGoal(new goals.GoalFollow(target, 3));
     }
-
+    
   }, 500);
-
-  timers.combatInterval = combatInterval;
 }
 
 // Web server
@@ -283,287 +240,23 @@ function addGameLog(message, botNumber = 'SYSTEM') {
   return log;
 }
 
-// ---------------------------------------------------------------------------
-// Natural / human-like anti-AFK movement
-// ---------------------------------------------------------------------------
-// Real players don't move in fixed 3-6s bursts, don't snap their camera
-// instantly, and often pause doing nothing for several seconds. This loop
-// approximates that instead of the old fixed-interval "pick an action, hold
-// it, snap the camera" pattern.
-function startMovementLoop(bot, botNumber) {
-  const timers = getTimerBucket(botNumber);
-
-  // Smoothly interpolate the bot's view over several small steps instead of
-  // teleporting the camera to a new yaw/pitch instantly.
-  function smoothLook(targetYaw, targetPitch, steps, stepDelay) {
-    let i = 0;
-    const startYaw = bot.entity ? bot.entity.yaw : 0;
-    const startPitch = bot.entity ? bot.entity.pitch : 0;
-
-    function step() {
-      if (!bot.entity) return;
-      i++;
-      const t = i / steps;
-      // ease-out so the turn slows down at the end, like a real mouse move
-      const eased = 1 - Math.pow(1 - t, 2);
-      const yaw = startYaw + (targetYaw - startYaw) * eased;
-      const pitch = startPitch + (targetPitch - startPitch) * eased;
-      bot.look(yaw, pitch, true);
-      if (i < steps) {
-        setTimeout(step, stepDelay);
-      }
-    }
-    step();
-  }
-
-  function movementLoop() {
-    if (!bot.entity) {
-      timers.movementTimeout = setTimeout(movementLoop, 5000);
-      return;
-    }
-
-    // Occasionally just idle - real players stand still fairly often
-    const idleRoll = Math.random();
-    if (idleRoll < 0.25) {
-      const idleFor = 2000 + Math.random() * 5000;
-      timers.movementTimeout = setTimeout(movementLoop, idleFor);
-      return;
-    }
-
-    // Weighted action pool - small look/step adjustments are far more common
-    // than big movements, mirroring how real players actually behave.
-    const weightedActions = [
-      { action: 'forward', weight: 4 },
-      { action: 'back', weight: 2 },
-      { action: 'left', weight: 3 },
-      { action: 'right', weight: 3 },
-      { action: 'sneak', weight: 2 },
-      { action: 'jump', weight: 1 },
-      { action: 'lookOnly', weight: 3 }
-    ];
-    const totalWeight = weightedActions.reduce((s, a) => s + a.weight, 0);
-    let roll = Math.random() * totalWeight;
-    let action = 'lookOnly';
-    for (const a of weightedActions) {
-      if (roll < a.weight) { action = a.action; break; }
-      roll -= a.weight;
-    }
-
-    // Gradual head turn to a new random-ish direction
-    const currentYaw = bot.entity.yaw;
-    const yawDelta = (Math.random() - 0.5) * Math.PI; // up to ~90 degrees either way
-    const targetYaw = currentYaw + yawDelta;
-    const targetPitch = Math.random() * 0.6 - 0.3; // mild up/down, avoid looking straight up/down
-    smoothLook(targetYaw, targetPitch, 6, 80 + Math.random() * 60);
-
-    if (action === 'jump') {
-      // Only jump if actually on the ground - constant airborne jump spam
-      // is a dead giveaway of scripted behavior.
-      if (bot.entity.onGround) {
-        bot.setControlState('jump', true);
-        setTimeout(() => bot.setControlState('jump', false), 250);
-      }
-    } else if (action !== 'lookOnly') {
-      bot.setControlState(action, true);
-      const holdFor = 400 + Math.random() * 900;
-      setTimeout(() => {
-        if (bot) bot.setControlState(action, false);
-      }, holdFor);
-    }
-
-    // Irregular gap before the next beat - avoids a robotic fixed cadence
-    const nextIn = 2500 + Math.random() * 4500;
-    timers.movementTimeout = setTimeout(movementLoop, nextIn);
-  }
-
-  movementLoop();
-}
-
-// ---------------------------------------------------------------------------
-// Opt-in mining mode: gathers a whitelisted set of block types inside a
-// rectangular zone you define. Off by default per bot. Never digs outside
-// the configured zone and never touches blocks not on the whitelist.
-// ---------------------------------------------------------------------------
-function inZone(pos, corner1, corner2) {
-  const minX = Math.min(corner1.x, corner2.x), maxX = Math.max(corner1.x, corner2.x);
-  const minY = Math.min(corner1.y, corner2.y), maxY = Math.max(corner1.y, corner2.y);
-  const minZ = Math.min(corner1.z, corner2.z), maxZ = Math.max(corner1.z, corner2.z);
-  return pos.x >= minX && pos.x <= maxX &&
-         pos.y >= minY && pos.y <= maxY &&
-         pos.z >= minZ && pos.z <= maxZ;
-}
-
-function findNextMiningTarget(bot, cfg) {
-  const { Vec3 } = require('vec3');
-  const minX = Math.min(cfg.corner1.x, cfg.corner2.x), maxX = Math.max(cfg.corner1.x, cfg.corner2.x);
-  const minY = Math.min(cfg.corner1.y, cfg.corner2.y), maxY = Math.max(cfg.corner1.y, cfg.corner2.y);
-  const minZ = Math.min(cfg.corner1.z, cfg.corner2.z), maxZ = Math.max(cfg.corner1.z, cfg.corner2.z);
-
-  // Search blocks near the bot first, within the configured zone only.
-  const candidates = bot.findBlocks({
-    matching: (block) => block && cfg.blocks.includes(block.name),
-    maxDistance: 48,
-    count: 20
-  }) || [];
-
-  for (const pos of candidates) {
-    if (pos.x >= minX && pos.x <= maxX &&
-        pos.y >= minY && pos.y <= maxY &&
-        pos.z >= minZ && pos.z <= maxZ) {
-      return bot.blockAt(pos);
-    }
-  }
-  return null;
-}
-
-// Check whether the bot currently has a tool capable of harvesting a drop
-// from this block. Mining ores with the wrong tool (or bare hands) either
-// fails to break the block or breaks it with no drop, so we skip those
-// instead of wasting time "mining" nothing.
-function hasRequiredTool(bot, block) {
-  try {
-    const mcData = require('minecraft-data')(bot.version || "1.20.1");
-    const blockData = mcData.blocksByName[block.name];
-    if (!blockData || !blockData.harvestTools) {
-      // Block has no tool restriction (e.g. dirt, sand) - anything works
-      return { ok: true };
-    }
-
-    const requiredToolIds = Object.keys(blockData.harvestTools).map(id => parseInt(id));
-    const inventory = bot.inventory.items();
-
-    for (const item of inventory) {
-      if (requiredToolIds.includes(item.type)) {
-        return { ok: true, tool: item };
-      }
-    }
-
-    // Build a readable list of acceptable tool names for logging
-    const acceptableNames = requiredToolIds
-      .map(id => mcData.items[id]?.name)
-      .filter(Boolean);
-
-    return { ok: false, needs: acceptableNames };
-  } catch (e) {
-    // If we can't determine requirements, don't block mining on an unknown error
-    return { ok: true };
-  }
-}
-
-function startMiningLoop(bot, botNumber) {
-  const timers = getTimerBucket(botNumber);
-
-  function loop() {
-    const cfg = botMiningConfig.get(botNumber);
-
-    // Stop the loop entirely if mining was disabled or the bot has no zone set
-    if (!cfg || !cfg.enabled || !cfg.corner1 || !cfg.corner2 || !cfg.blocks || cfg.blocks.length === 0) {
-      return; // don't reschedule - restarted explicitly when mining is re-enabled
-    }
-
-    if (!bot.entity || bot.combatMode) {
-      timers.miningTimeout = setTimeout(loop, 3000);
-      return;
-    }
-
-    const target = findNextMiningTarget(bot, cfg);
-    if (!target) {
-      addGameLog(`⛏️ No target blocks found in zone right now, retrying...`, botNumber);
-      timers.miningTimeout = setTimeout(loop, 5000);
-      return;
-    }
-
-    // Never dig outside the zone, double check even though findNextMiningTarget filters
-    if (!inZone(target.position, cfg.corner1, cfg.corner2)) {
-      timers.miningTimeout = setTimeout(loop, 3000);
-      return;
-    }
-
-    if (!bot.canDigBlock(target)) {
-      timers.miningTimeout = setTimeout(loop, 3000);
-      return;
-    }
-
-    const goals_ = require('mineflayer-pathfinder').goals;
-    const goal = new goals_.GoalGetToBlock(target.position.x, target.position.y, target.position.z);
-
-    if (bot.pathfinder) {
-      bot.pathfinder.setGoal(goal);
-    }
-
-    // Give pathfinder time to arrive, then attempt the dig
-    timers.miningTimeout = setTimeout(() => {
-      const cfgNow = botMiningConfig.get(botNumber);
-      if (!cfgNow || !cfgNow.enabled) return;
-      if (!bot.entity || bot.combatMode) {
-        timers.miningTimeout = setTimeout(loop, 3000);
-        return;
-      }
-
-      const blockNow = bot.blockAt(target.position);
-      if (!blockNow || !cfgNow.blocks.includes(blockNow.name) || !inZone(blockNow.position, cfgNow.corner1, cfgNow.corner2)) {
-        timers.miningTimeout = setTimeout(loop, 2000);
-        return;
-      }
-
-      const dist = bot.entity.position.distanceTo(blockNow.position);
-      if (dist > 5) {
-        // Still traveling, check again shortly
-        timers.miningTimeout = setTimeout(loop, 2000);
-        return;
-      }
-
-      const toolCheck = hasRequiredTool(bot, blockNow);
-      if (!toolCheck.ok) {
-        addGameLog(`🔧 Skipping ${blockNow.name} - need one of: ${toolCheck.needs.join(', ')}`, botNumber);
-        timers.miningTimeout = setTimeout(loop, 4000);
-        return;
-      }
-
-      const tool = getBestToolForBlock(blockNow.name, bot);
-      const equipPromise = tool ? bot.equip(tool, 'hand').catch(() => {}) : Promise.resolve();
-
-      equipPromise.then(() => {
-        bot.dig(blockNow, (err) => {
-          if (err) {
-            addGameLog(`⛏️ Dig error: ${err.message}`, botNumber);
-          } else {
-            addGameLog(`⛏️ Mined ${blockNow.name}`, botNumber);
-          }
-          timers.miningTimeout = setTimeout(loop, 1500 + Math.random() * 1500);
-        });
-      });
-    }, 4000);
-  }
-
-  loop();
-}
-
-function stopMiningLoop(botId) {
-  const timers = botTimers.get(botId);
-  if (timers && timers.miningTimeout) {
-    clearTimeout(timers.miningTimeout);
-    timers.miningTimeout = null;
-  }
-}
-
 // Create new bot with connection throttling
 function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, customUUID = null) {
   if (removedBots.has(botNumber)) {
     console.log(`[BOT ${botNumber}] This bot was manually removed. Not recreating.`);
     return null;
   }
-
+  
   // Check if bot is manually stopped
   if (botControlStates.get(botNumber) === 'STOPPED') {
     addGameLog(`⏸️ Bot ${botNumber} is manually stopped. Not connecting.`, botNumber);
     return null;
   }
-
+  
   // Check global leave mode
   if (globalLeaveMode) {
     addGameLog(`🌍 Skipping connection due to global leave mode`, botNumber);
-
+    
     // Schedule reconnect after global leave ends
     setTimeout(() => {
       if (!globalLeaveMode && !removedBots.has(botNumber)) {
@@ -573,10 +266,10 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
         }
       }
     }, 61000); // Slightly more than 1 minute
-
+    
     return null;
   }
-
+  
   // Check connection throttling
   const botData = allBots.get(botNumber);
   if (botData && botData.reconnectAttempts > 3) {
@@ -584,7 +277,7 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     if (timeSinceLastAttempt < 30000) { // 30 seconds throttle
       const waitTime = Math.ceil((30000 - timeSinceLastAttempt) / 1000);
       addGameLog(`⏳ Connection throttled for bot ${botNumber}. Please wait ${waitTime}s before reconnect.`, botNumber);
-
+      
       // Schedule reconnect after throttle period
       setTimeout(() => {
         if (!removedBots.has(botNumber)) {
@@ -594,25 +287,25 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       return null;
     }
   }
-
+  
   let identity;
   if (useNewIdentity || !botIdentities.has(botNumber)) {
     identity = generateNewIdentity(botNumber, customName, customUUID);
   } else {
     identity = getBotIdentity(botNumber);
   }
-
+  
   // Validate custom name length
   if (customName && customName.length < 4) {
     addGameLog(`❌ Custom name must be at least 4 characters: ${customName}`, botNumber);
     return null;
   }
-
+  
   const botName = identity.name;
   const botUUID = identity.uuid;
-
+  
   addGameLog(`🔗 Connecting as ${botName}`, botNumber);
-
+  
   const bot = mineflayer.createBot({
     host: config.server.ip,
     port: config.server.port,
@@ -625,7 +318,7 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     keepAliveInterval: 5000,        // send every 5 seconds
     hideErrors: true
   });
-
+  
   bot.botId = botNumber;
   bot.botName = botName;
   bot.botUUID = botUUID;
@@ -636,7 +329,7 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
   bot.lastAttackTime = 0;
   bot.combatMode = false;
   bot.controlState = botControlStates.get(botNumber) || 'RUNNING';
-
+  
   // Update bot data in allBots map
   allBots.set(botNumber, {
     bot: bot,
@@ -649,9 +342,9 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     food: 20,
     controlState: bot.controlState
   });
-
+  
   let defaultMove = null;
-
+  
   bot.on('inject_allowed', () => {
     const mcData = require('minecraft-data')(bot.version || "1.20.1");
     if (mcData) {
@@ -663,164 +356,186 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       bot.pathfinder.setMovements(defaultMove);
     }
   });
-
+  
   bot.once('spawn', () => {
     addGameLog(`✅ Spawned in world.`, botNumber);
-
+    
     const botData = allBots.get(botNumber);
     if (botData) {
       botData.online = true;
       botData.status = 'online';
       botData.reconnectAttempts = 0; // Reset reconnect attempts on successful connection
     }
-
+    
     bot.settings.colorsEnabled = false;
-
+    
     // Update health and food
     bot.on('health', () => {
       const botData = allBots.get(botNumber);
       if (botData) {
         botData.health = bot.health;
-        botData.food = bot.food;
       }
     });
+    
+    bot.on('food', () => {
+      const botData = allBots.get(botNumber);
+      if (botData) {
+        botData.food = bot.food;
+      }
+      // NO heartbeat here – it's moved outside to avoid multiple intervals
+    });
+    
+    // ANTI-AFK movements – stronger version
+    const movementLoop = () => {
+      if (!bot?.entity) {
+        setTimeout(movementLoop, 5000);
+        return;
+      }
 
-    // Natural anti-AFK movement
-    const timers = getTimerBucket(botNumber);
+      const actions = ['forward', 'back', 'left', 'right', 'jump', 'sprint', 'sneak'];
+      const action = actions[Math.floor(Math.random() * actions.length)];
+      bot.setControlState(action, true);
+
+      // Randomly look around to appear more human
+      bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI / 2 - Math.PI / 4);
+
+      setTimeout(() => {
+        if (bot) bot.setControlState(action, false);
+        // Schedule next move in 3‑6 seconds
+        setTimeout(movementLoop, 3000 + Math.random() * 3000);
+      }, 500 + Math.random() * 1000);
+    };
+
     if (config.utils["anti-afk"] !== false) {
-      startMovementLoop(bot, botNumber);
+      movementLoop();
     }
-
-    // Opt-in mining mode - only runs if explicitly enabled for this bot via the API
-    const miningCfg = botMiningConfig.get(botNumber);
-    if (miningCfg && miningCfg.enabled) {
-      startMiningLoop(bot, botNumber);
-    }
+    // ✅ FIX: no extra `);` here – just a closing brace for the if statement
 
     // Optional heartbeat chat to prevent idle kicks
+    // ✅ FIX: moved outside the food event, so only one interval is created
     if (config.utils["chat-heartbeat"] !== false) {
-      timers.heartbeatInterval = setInterval(() => {
-        safeChat(bot, '/help');
+      setInterval(() => {
+        if (bot.entity) bot.chat('/help');
       }, 60000 + Math.random() * 60000);
     }
 
     // Combat AI - Only attacks when attacked first
     bot.on('entityHurt', (entity) => {
       if (entity !== bot.entity) return;
-
+      
       const damageEvents = Object.values(bot.entity.damageHistory || {});
       if (damageEvents.length === 0) return;
-
+      
       const recentDamage = damageEvents[damageEvents.length - 1];
       const attacker = recentDamage.attacker;
-
+      
       // Only attack if a player attacked first and we don't already have a target
       if (attacker && attacker.type === 'player' && !bot.lockedTarget) {
         bot.lockedTarget = attacker;
         bot.combatMode = true;
         bot.lastAttackTime = Date.now();
-
+        
         const attackerName = attacker.username || 'Unknown';
-
+        
         // Store target
         botTargets.set(botNumber, {
           targetPlayer: attackerName,
           lastMessageTime: Date.now()
         });
-
+        
         // Send mocking message
         const message = getMockingMessage(attackerName);
         setTimeout(() => {
           if (bot.entity) {
-            safeChat(bot, message);
+            bot.chat(message);
             addGameLog(`🗣️ "${message}"`, botNumber);
           }
         }, 1000);
-
+        
         addGameLog(`🔒 Locked on ${attackerName}! Combat mode activated.`, botNumber);
-
+        
         // Auto equip best weapon
-        const weapons = bot.inventory.items().filter(item =>
+        const weapons = bot.inventory.items().filter(item => 
           item.name.includes('sword') || item.name.includes('axe')
         );
-
+        
         if (weapons.length > 0) {
           const bestWeapon = weapons.reduce((best, item) => {
             const damage = getWeaponDamage(item.name);
             return damage > best.damage ? { item, damage } : best;
           }, { item: null, damage: 0 });
-
+          
           if (bestWeapon.item) {
-            bot.equip(bestWeapon.item, 'hand').catch(() => {});
+            bot.equip(bestWeapon.item, 'hand');
           }
         }
-
+        
         // Start combat routine
         startCombatRoutine(bot, botNumber);
       }
     });
-
+    
     // Clear target on death
     bot.on('death', () => {
       addGameLog(`☠️ Bot died.`, botNumber);
       bot.combatMode = false;
       bot.lockedTarget = null;
       botTargets.delete(botNumber);
-      if (bot.pvp) bot.pvp.stop();
+      bot.pvp.stop();
     });
-
+    
     // Chat logging with "bot leave" command detection
     bot.on('chat', (username, message) => {
       if (username !== bot.username) {
         addGameLog(`💬 <${username}> ${message}`, botNumber);
-
+        
         // Check for global leave command (case insensitive)
         if (message.toLowerCase().includes('bot leave')) {
           activateGlobalLeave();
         }
       }
-
-      if (message.toLowerCase().includes('was killed') ||
+      
+      if (message.toLowerCase().includes('was killed') || 
           message.toLowerCase().includes('slain') ||
           message.toLowerCase().includes('died')) {
         addGameLog(`💀 ${message}`, botNumber);
       }
-
-      if (message.toLowerCase().includes('joined') ||
+      
+      if (message.toLowerCase().includes('joined') || 
           message.toLowerCase().includes('left') ||
           message.toLowerCase().includes('achievement') ||
           message.toLowerCase().includes('advancement')) {
         addGameLog(`📢 ${message}`, botNumber);
       }
     });
-
+    
     // Player join/leave events
     bot.on('playerJoined', (player) => {
       if (player.username !== bot.username) {
         addGameLog(`➡️ ${player.username} joined the game`, botNumber);
       }
     });
-
+    
     bot.on('playerLeft', (player) => {
       if (player.username !== bot.username) {
         addGameLog(`⬅️ ${player.username} left the game`, botNumber);
       }
     });
-
+    
     // AUTH SEQUENCE
     if (config.utils["auto-auth"]?.enabled) {
       const pass = config.utils["auto-auth"].password;
-
+      
       setTimeout(() => {
-        safeChat(bot, `/register ${pass} ${pass}`);
-
+        bot.chat(`/register ${pass} ${pass}`);
+        
         setTimeout(() => {
-          safeChat(bot, `/login ${pass}`);
-
+          bot.chat(`/login ${pass}`);
+          
           if (config.utils["join-command"]?.enabled) {
             const cmd = config.utils["join-command"].command;
             setTimeout(() => {
-              safeChat(bot, cmd);
+              bot.chat(cmd);
             }, 2000);
           }
         }, 2000);
@@ -828,20 +543,18 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     } else if (config.utils["join-command"]?.enabled) {
       const cmd = config.utils["join-command"].command;
       setTimeout(() => {
-        safeChat(bot, cmd);
+        bot.chat(cmd);
       }, 4000);
     }
   });
-
+  
   // KICK HANDLING - Bot stays in list
   bot.on('kicked', (reason) => {
     const kickMsg = typeof reason === 'string' ? reason : JSON.stringify(reason);
     bot.lastKickReason = kickMsg;
-
+    
     addGameLog(`🚫 Kicked: ${kickMsg.substring(0, 100)}`, botNumber);
-
-    clearBotTimers(botNumber);
-
+    
     // Update bot status
     const botData = allBots.get(botNumber);
     if (botData) {
@@ -850,14 +563,14 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       botData.lastSeen = new Date().toISOString();
       botData.lastReconnectAttempt = Date.now();
     }
-
-    const isBan = kickMsg.toLowerCase().includes("ban") ||
+    
+    const isBan = kickMsg.toLowerCase().includes("ban") || 
                   kickMsg.toLowerCase().includes("banned") ||
                   kickMsg.toLowerCase().includes("permanent") ||
                   kickMsg.toLowerCase().includes("blacklist") ||
                   kickMsg.toLowerCase().includes("hacking") ||
                   kickMsg.toLowerCase().includes("cheat");
-
+    
     if (isBan) {
       addGameLog(`🔨 BAN detected! Generating new identity...`, botNumber);
       bot.isBanned = true;
@@ -867,12 +580,10 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       bot.isBanned = false;
     }
   });
-
+  
   bot.on('error', (err) => {
     addGameLog(`❌ Error: ${err.message}`, botNumber);
-
-    clearBotTimers(botNumber);
-
+    
     // Update bot status
     const botData = allBots.get(botNumber);
     if (botData) {
@@ -882,11 +593,9 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       botData.lastReconnectAttempt = Date.now();
     }
   });
-
+  
   // AUTO-RECONNECT with throttle
   bot.on('end', () => {
-    clearBotTimers(botNumber);
-
     // Update bot status
     const botData = allBots.get(botNumber);
     if (botData) {
@@ -894,37 +603,37 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       botData.status = 'disconnected';
       botData.lastSeen = new Date().toISOString();
     }
-
+    
     // Check if manually stopped
     if (botControlStates.get(botNumber) === 'STOPPED') {
       addGameLog(`⏸️ Bot ${botNumber} is manually stopped. No auto-reconnect.`, botNumber);
       return;
     }
-
+    
     if (bot.manuallyRemoved) {
       addGameLog(`Bot ${botNumber} was manually removed. No auto-reconnect.`, botNumber);
       return;
     }
-
+    
     if (!config.utils["auto-reconnect"]) {
       addGameLog(`Auto-reconnect disabled for bot ${botNumber}`, botNumber);
       return;
     }
-
+    
     if (removedBots.has(botNumber)) {
       return;
     }
-
+    
     const delay = config.utils["auto-reconnect-delay"] || 15000;
     addGameLog(`Reconnecting bot ${botNumber} in ${delay/1000}s...`, botNumber);
-
+    
     setTimeout(() => {
       if (!removedBots.has(botNumber)) {
         createNewBot(botNumber, false);
       }
     }, delay);
   });
-
+  
   return bot;
 }
 
@@ -946,10 +655,10 @@ function getBestToolForBlock(blockName, bot) {
     'log': 'axe', 'planks': 'axe', 'dirt': 'shovel',
     'grass': 'shovel', 'sand': 'shovel', 'gravel': 'shovel'
   };
-
+  
   for (const [block, tool] of Object.entries(toolMap)) {
     if (blockName.includes(block)) {
-      const tools = bot.inventory.items().filter(item =>
+      const tools = bot.inventory.items().filter(item => 
         item.name.includes(tool.replace('pickaxe', '').replace('axe', '').replace('shovel', ''))
       );
       if (tools.length > 0) {
@@ -970,7 +679,7 @@ app.get('/', (req, res) => {
   const onlineCount = Array.from(allBots.values()).filter(b => b.online).length;
   const totalCount = allBots.size;
   const stoppedCount = Array.from(botControlStates.entries()).filter(([id, state]) => state === 'STOPPED').length;
-
+  
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
@@ -982,9 +691,9 @@ app.get('/', (req, res) => {
         * { box-sizing: border-box; margin: 0; padding: 0; }
         :root { --primary: #4f46e5; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --success: #22c55e; --danger: #ef4444; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; }
-
+        
         .mobile-container { display: flex; flex-direction: column; height: 100vh; }
-
+        
         /* Header */
         .header { background: var(--card); padding: 1rem; border-bottom: 1px solid #334155; }
         .header h1 { font-size: 1.25rem; margin: 0; background: linear-gradient(to right, #818cf8, #c084fc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
@@ -992,17 +701,17 @@ app.get('/', (req, res) => {
         .server-info div { display: flex; justify-content: space-between; margin-bottom: 0.25rem; }
         .server-label { color: #94a3b8; font-size: 0.875rem; }
         .server-value { font-weight: bold; }
-
+        
         /* Main content with tabs */
         .main-content { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
         .tabs { display: flex; background: var(--card); border-bottom: 1px solid #334155; }
         .tab { flex: 1; padding: 0.75rem; text-align: center; background: none; border: none; color: #94a3b8; font-size: 0.9rem; cursor: pointer; }
         .tab.active { color: white; border-bottom: 2px solid var(--primary); background: rgba(79, 70, 229, 0.1); }
-
+        
         /* Tab content */
         .tab-content { flex: 1; overflow-y: auto; padding: 1rem; display: none; }
         .tab-content.active { display: flex; flex-direction: column; }
-
+        
         /* Common styles */
         .card { background: var(--card); border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem; border: 1px solid #334155; }
         .btn { background: var(--primary); color: white; border: none; padding: 0.75rem 1rem; border-radius: 0.5rem; font-size: 0.9rem; cursor: pointer; width: 100%; margin-bottom: 0.5rem; }
@@ -1014,7 +723,7 @@ app.get('/', (req, res) => {
         .btn-tiny { padding: 0.25rem 0.5rem; font-size: 0.7rem; }
         input, select, textarea { width: 100%; padding: 0.75rem; background: #0f172a; border: 1px solid #334155; border-radius: 0.5rem; color: white; margin-bottom: 0.5rem; font-size: 1rem; }
         textarea { height: 80px; resize: vertical; font-family: monospace; }
-
+        
         /* Console */
         .console { background: #000; color: #e0e0e0; padding: 1rem; border-radius: 0.5rem; font-family: 'Courier New', monospace; height: 300px; overflow-y: auto; font-size: 0.85rem; flex: 1; }
         .log-entry { margin-bottom: 0.25rem; padding: 0.25rem; border-bottom: 1px solid #1a1a1a; font-size: 0.8rem; line-height: 1.3; word-break: break-word; }
@@ -1029,7 +738,7 @@ app.get('/', (req, res) => {
         .log-ban { color: #ff4757; }
         .log-throttle { color: #ffb142; }
         .log-mock { color: #ff6bcb; }
-
+        
         /* Bot list */
         .bot-list { max-height: 300px; overflow-y: auto; margin-bottom: 1rem; }
         .bot-item { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: #334155; border-radius: 0.5rem; margin-bottom: 0.5rem; }
@@ -1052,17 +761,17 @@ app.get('/', (req, res) => {
         .bot-stop { background: #dc2626; }
         .bot-resume { background: #059669; }
         .bot-remove { background: #7f1d1d; }
-
+        
         /* Form sections */
         .form-section { margin-bottom: 1.5rem; }
         .form-section h4 { margin-bottom: 0.5rem; color: #94a3b8; font-size: 0.9rem; }
-
+        
         /* Stats cards */
         .stats-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-bottom: 1rem; }
         .stat-card { background: #334155; padding: 0.75rem; border-radius: 0.5rem; text-align: center; }
         .stat-label { font-size: 0.75rem; color: #94a3b8; }
         .stat-value { font-size: 1.25rem; font-weight: bold; }
-
+        
         /* Mobile optimizations */
         @media (max-width: 768px) {
           .header h1 { font-size: 1.1rem; }
@@ -1070,7 +779,7 @@ app.get('/', (req, res) => {
           .console { height: 250px; }
           .stats-cards { grid-template-columns: 1fr; }
         }
-
+        
         /* Dark scrollbar */
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: #1e293b; }
@@ -1094,16 +803,15 @@ app.get('/', (req, res) => {
             </div>
           </div>
         </div>
-
+        
         <!-- Tabs -->
         <div class="tabs">
           <button class="tab active" onclick="switchTab('dashboard')">🏠 Dashboard</button>
           <button class="tab" onclick="switchTab('bots')">🤖 Bots</button>
-          <button class="tab" onclick="switchTab('mining')">⛏️ Mining</button>
           <button class="tab" onclick="switchTab('console')">📟 Console</button>
           <button class="tab" onclick="switchTab('server')">🌐 Server</button>
         </div>
-
+        
         <!-- Main content -->
         <div class="main-content">
           <!-- Dashboard Tab -->
@@ -1122,7 +830,7 @@ app.get('/', (req, res) => {
                 <div class="stat-value" id="dashboardStoppedBots">${stoppedCount}</div>
               </div>
             </div>
-
+            
             <div class="card">
               <h3 style="margin-bottom: 1rem; display: flex; justify-content: space-between; align-items: center;">
                 <span>Available Bots</span>
@@ -1137,12 +845,12 @@ app.get('/', (req, res) => {
               </div>
             </div>
           </div>
-
+          
           <!-- Bots Tab -->
           <div class="tab-content" id="botsTab">
             <div class="card">
               <h3 style="margin-bottom: 1rem;">Create Bots</h3>
-
+              
               <div class="form-section">
                 <h4>Quick Random Bots</h4>
                 <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 0.5rem; margin-bottom: 1rem;">
@@ -1150,7 +858,7 @@ app.get('/', (req, res) => {
                   <button class="btn btn-success" onclick="addCustomBots()">Add Random</button>
                 </div>
               </div>
-
+              
               <div class="form-section">
                 <h4>Custom Bot with UUID</h4>
                 <input type="text" id="customBotName" placeholder="Bot username (min 4 characters)">
@@ -1160,17 +868,17 @@ app.get('/', (req, res) => {
                   <button class="btn btn-small" onclick="generateRandomUUID()" style="flex: 0 0 auto;">Generate UUID</button>
                 </div>
               </div>
-
+              
               <button class="btn btn-danger" onclick="removeAllBots()" style="margin-top: 1rem;">Remove All Bots</button>
             </div>
-
+            
             <div class="card">
               <h3>Bot Management</h3>
               <div id="botManagementList">
                 <!-- Bot management will be loaded here -->
               </div>
             </div>
-
+            
             <div class="card">
               <h3>Send Command</h3>
               <select id="targetBot">
@@ -1183,48 +891,7 @@ app.get('/', (req, res) => {
               </div>
             </div>
           </div>
-
-          <!-- Mining Tab -->
-          <div class="tab-content" id="miningTab">
-            <div class="card">
-              <h3 style="margin-bottom: 1rem;">Mining Zone Setup</h3>
-              <div class="form-section">
-                <h4>Select Bot</h4>
-                <select id="miningBotSelect">
-                  <!-- populated dynamically -->
-                </select>
-              </div>
-              <div class="form-section">
-                <h4>Zone Corner 1</h4>
-                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem;">
-                  <input type="number" id="miningC1X" placeholder="X">
-                  <input type="number" id="miningC1Y" placeholder="Y">
-                  <input type="number" id="miningC1Z" placeholder="Z">
-                </div>
-              </div>
-              <div class="form-section">
-                <h4>Zone Corner 2</h4>
-                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem;">
-                  <input type="number" id="miningC2X" placeholder="X">
-                  <input type="number" id="miningC2Y" placeholder="Y">
-                  <input type="number" id="miningC2Z" placeholder="Z">
-                </div>
-              </div>
-              <div class="form-section">
-                <h4>Target Blocks (comma separated)</h4>
-                <input type="text" id="miningBlocks" placeholder="coal_ore, iron_ore, deepslate_iron_ore">
-              </div>
-              <button class="btn btn-success" onclick="saveMiningConfig()">Save Zone</button>
-            </div>
-
-            <div class="card">
-              <h3 style="margin-bottom: 1rem;">Mining Status</h3>
-              <div id="miningStatusList">
-                <!-- populated dynamically -->
-              </div>
-            </div>
-          </div>
-
+          
           <!-- Console Tab -->
           <div class="tab-content" id="consoleTab">
             <div class="card" style="flex: 1; display: flex; flex-direction: column;">
@@ -1244,7 +911,7 @@ app.get('/', (req, res) => {
               </div>
             </div>
           </div>
-
+          
           <!-- Server Tab -->
           <div class="tab-content" id="serverTab">
             <div class="card">
@@ -1253,14 +920,14 @@ app.get('/', (req, res) => {
               <input type="number" id="serverPort" placeholder="Port" value="${config.server.port}">
               <button class="btn" onclick="updateServer()">Update Server</button>
             </div>
-
+            
             <div class="card">
               <h3>Recent Servers</h3>
               <div class="history-list" id="serverHistory">
                 <!-- History will be loaded here -->
               </div>
             </div>
-
+            
             <div class="card">
               <h3>Bot Settings</h3>
               <div style="display: flex; flex-direction: column; gap: 0.5rem;">
@@ -1282,15 +949,15 @@ app.get('/', (req, res) => {
           </div>
         </div>
       </div>
-
+      
       <script>
         let autoScroll = true;
         let selectedBotId = 'all';
-
+        
         // Initialize
         updateAllData();
         setInterval(updateAllData, 1500);
-
+        
         function updateAllData() {
           updateStats();
           updateBotList();
@@ -1298,10 +965,8 @@ app.get('/', (req, res) => {
           updateFullConsole();
           updateServerHistory();
           updateBotDropdown();
-          updateMiningBotSelect();
-          updateMiningStatus();
         }
-
+        
         function updateStats() {
           fetch('/api/stats')
             .then(res => res.json())
@@ -1313,30 +978,30 @@ app.get('/', (req, res) => {
               document.getElementById('botCount').textContent = \`\${data.totalBots} bots\`;
             });
         }
-
+        
         function updateBotList() {
           fetch('/api/bots')
             .then(res => res.json())
             .then(data => {
               const botList = document.getElementById('botList');
               botList.innerHTML = '';
-
+              
               if (data.bots.length === 0) {
                 botList.innerHTML = '<div style="text-align: center; color: #94a3b8; padding: 1rem;">No bots created yet. Add a bot to start.</div>';
                 return;
               }
-
+              
               // Sort bots by ID
               data.bots.sort((a, b) => a.id - b.id);
-
+              
               data.bots.forEach(bot => {
                 const botDiv = document.createElement('div');
                 botDiv.className = 'bot-item';
-
+                
                 // Determine status class
                 let statusClass = 'bot-status-';
                 let statusText = '';
-
+                
                 if (bot.controlState === 'STOPPED') {
                   statusClass += 'stopped';
                   statusText = '⏸️ Stopped';
@@ -1347,7 +1012,7 @@ app.get('/', (req, res) => {
                   statusClass += bot.status || 'offline';
                   statusText = \`🔴 \${bot.status || 'Offline'}\`;
                 }
-
+                
                 botDiv.innerHTML = \`
                   <div class="bot-info">
                     <div class="bot-name">\${bot.name}</div>
@@ -1357,8 +1022,8 @@ app.get('/', (req, res) => {
                     </div>
                   </div>
                   <div class="bot-controls">
-                    \${bot.controlState === 'STOPPED' ?
-                      \`<button class="bot-control-btn bot-resume" onclick="startBot(\${bot.id})" title="Start bot">▶</button>\` :
+                    \${bot.controlState === 'STOPPED' ? 
+                      \`<button class="bot-control-btn bot-resume" onclick="startBot(\${bot.id})" title="Start bot">▶</button>\` : 
                       \`<button class="bot-control-btn bot-stop" onclick="stopBot(\${bot.id})" title="Stop bot">⏸</button>\`
                     }
                     <button class="bot-control-btn bot-remove" onclick="removeBot(\${bot.id})" title="Remove bot">X</button>
@@ -1368,29 +1033,29 @@ app.get('/', (req, res) => {
               });
             });
         }
-
+        
         function updateBotManagement() {
           fetch('/api/bots')
             .then(res => res.json())
             .then(data => {
               const mgmtList = document.getElementById('botManagementList');
               mgmtList.innerHTML = '';
-
+              
               if (data.bots.length === 0) {
                 mgmtList.innerHTML = '<div style="text-align: center; color: #94a3b8; padding: 1rem;">No bots to manage</div>';
                 return;
               }
-
+              
               // Sort bots by ID
               data.bots.sort((a, b) => a.id - b.id);
-
+              
               data.bots.forEach(bot => {
                 const botDiv = document.createElement('div');
                 botDiv.className = 'bot-item';
-
+                
                 let statusClass = 'bot-status-';
                 let statusText = '';
-
+                
                 if (bot.controlState === 'STOPPED') {
                   statusClass += 'stopped';
                   statusText = '⏸️ Stopped';
@@ -1401,7 +1066,7 @@ app.get('/', (req, res) => {
                   statusClass += bot.status || 'offline';
                   statusText = \`🔴 \${bot.status || 'Offline'}\`;
                 }
-
+                
                 botDiv.innerHTML = \`
                   <div class="bot-info">
                     <div class="bot-name">\${bot.name}</div>
@@ -1410,8 +1075,8 @@ app.get('/', (req, res) => {
                     </div>
                   </div>
                   <div class="bot-controls">
-                    \${bot.controlState === 'STOPPED' ?
-                      \`<button class="bot-control-btn bot-resume" onclick="startBot(\${bot.id})" title="Start bot">▶</button>\` :
+                    \${bot.controlState === 'STOPPED' ? 
+                      \`<button class="bot-control-btn bot-resume" onclick="startBot(\${bot.id})" title="Start bot">▶</button>\` : 
                       \`<button class="bot-control-btn bot-stop" onclick="stopBot(\${bot.id})" title="Stop bot">⏸</button>\`
                     }
                     <button class="bot-control-btn bot-remove" onclick="removeBot(\${bot.id})" title="Remove bot">X</button>
@@ -1421,17 +1086,17 @@ app.get('/', (req, res) => {
               });
             });
         }
-
+        
         function updateBotDropdown() {
           fetch('/api/bots')
             .then(res => res.json())
             .then(data => {
               const dropdown = document.getElementById('targetBot');
               dropdown.innerHTML = '<option value="all">All Bots</option>';
-
+              
               // Sort bots by ID
               data.bots.sort((a, b) => a.id - b.id);
-
+              
               data.bots.forEach(bot => {
                 if (bot.online && bot.controlState !== 'STOPPED') {
                   const option = document.createElement('option');
@@ -1442,16 +1107,16 @@ app.get('/', (req, res) => {
               });
             });
         }
-
+        
         function updateFullConsole() {
           fetch('/api/console')
             .then(res => res.json())
             .then(data => {
               const consoleDiv = document.getElementById('gameConsole');
-
+              
               if (data.logs.length > 0) {
                 let newHTML = '';
-
+                
                 data.logs.forEach(log => {
                   let logClass = 'log-system';
                   if (log.includes('"') && (log.includes('finished') || log.includes('wrong bot') || log.includes('Game over'))) logClass = 'log-mock';
@@ -1464,26 +1129,26 @@ app.get('/', (req, res) => {
                   if (log.includes('Kicked:')) logClass = 'log-kick';
                   if (log.includes('BAN detected')) logClass = 'log-ban';
                   if (log.includes('Connection throttled')) logClass = 'log-throttle';
-
+                  
                   newHTML += \`<div class="log-entry \${logClass}">\${log}</div>\`;
                 });
-
+                
                 consoleDiv.innerHTML = newHTML;
-
+                
                 if (autoScroll) {
                   consoleDiv.scrollTop = consoleDiv.scrollHeight;
                 }
               }
             });
         }
-
+        
         function updateServerHistory() {
           fetch('/api/history')
             .then(res => res.json())
             .then(data => {
               const historyDiv = document.getElementById('serverHistory');
               historyDiv.innerHTML = '';
-
+              
               data.history.forEach(server => {
                 const item = document.createElement('div');
                 item.className = 'history-item';
@@ -1499,7 +1164,7 @@ app.get('/', (req, res) => {
               });
             });
         }
-
+        
         function addBot(count) {
           fetch('/api/bots/add', {
             method: 'POST',
@@ -1509,27 +1174,27 @@ app.get('/', (req, res) => {
             updateAllData();
           });
         }
-
+        
         function addCustomBots() {
           const count = parseInt(document.getElementById('addBotCount').value) || 1;
           addBot(count);
         }
-
+        
         // Add custom UUID bot
         function addCustomUUIDBot() {
           const name = document.getElementById('customBotName').value.trim();
           let uuid = document.getElementById('customBotUUID').value.trim();
-
+          
           if (!name) {
             alert('Please enter a bot username!');
             return;
           }
-
+          
           if (name.length < 4) {
             alert('Bot username must be at least 4 characters!');
             return;
           }
-
+          
           // If UUID is provided, validate format
           if (uuid) {
             const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1540,11 +1205,11 @@ app.get('/', (req, res) => {
           } else {
             uuid = null;
           }
-
+          
           fetch('/api/bots/add-custom', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+            body: JSON.stringify({ 
               name: name,
               uuid: uuid
             })
@@ -1560,7 +1225,7 @@ app.get('/', (req, res) => {
               }
             });
         }
-
+        
         // Generate random UUID
         function generateRandomUUID() {
           const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -1570,7 +1235,7 @@ app.get('/', (req, res) => {
           });
           document.getElementById('customBotUUID').value = uuid;
         }
-
+        
         // Bot control functions
         function stopBot(botId) {
           fetch(\`/api/bot/\${botId}/stop\`, { method: 'POST' })
@@ -1581,7 +1246,7 @@ app.get('/', (req, res) => {
               }
             });
         }
-
+        
         function startBot(botId) {
           fetch(\`/api/bot/\${botId}/start\`, { method: 'POST' })
             .then(res => res.json())
@@ -1591,7 +1256,7 @@ app.get('/', (req, res) => {
               }
             });
         }
-
+        
         function removeBot(botId) {
           if (confirm('Remove this bot permanently?')) {
             fetch('/api/bots/remove', {
@@ -1603,34 +1268,34 @@ app.get('/', (req, res) => {
             });
           }
         }
-
+        
         function removeAllBots() {
           if (confirm('Remove ALL bots permanently?')) {
             fetch('/api/bots/remove-all', { method: 'POST' })
               .then(() => updateAllData());
           }
         }
-
+        
         function updateServer() {
           const ip = document.getElementById('serverIp').value;
           const port = document.getElementById('serverPort').value;
-
+          
           fetch('/api/update-server', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ip: ip, port: parseInt(port) })
           }).then(() => updateAllData());
         }
-
+        
         function sendCommand(command, target = 'all') {
           if (!command || command.trim() === '') return;
-
+          
           fetch('/api/command', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+            body: JSON.stringify({ 
               command: command.trim(),
-              target: target
+              target: target 
             })
           }).then(response => response.json())
             .then(data => {
@@ -1642,7 +1307,7 @@ app.get('/', (req, res) => {
               console.error('Error sending command:', error);
             });
         }
-
+        
         function sendConsoleCommand() {
           const command = document.getElementById('consoleCommand').value;
           if (command.trim()) {
@@ -1650,7 +1315,7 @@ app.get('/', (req, res) => {
             document.getElementById('consoleCommand').value = '';
           }
         }
-
+        
         function sendSpecificCommand() {
           const command = document.getElementById('specificCommand').value;
           const target = document.getElementById('targetBot').value;
@@ -1659,18 +1324,18 @@ app.get('/', (req, res) => {
             document.getElementById('specificCommand').value = '';
           }
         }
-
+        
         function clearConsole() {
           fetch('/api/console/clear', { method: 'POST' })
             .then(() => updateFullConsole());
         }
-
+        
         function toggleAutoScroll() {
           autoScroll = !autoScroll;
-          document.getElementById('autoScrollBtn').textContent =
+          document.getElementById('autoScrollBtn').textContent = 
             \`Auto: \${autoScroll ? 'ON' : 'OFF'}\`;
         }
-
+        
         function switchTab(tabName) {
           document.querySelectorAll('.tab').forEach(tab => {
             tab.classList.remove('active');
@@ -1678,18 +1343,18 @@ app.get('/', (req, res) => {
           document.querySelectorAll('.tab-content').forEach(content => {
             content.classList.remove('active');
           });
-
+          
           event.target.classList.add('active');
           document.getElementById(\`\${tabName}Tab\`).classList.add('active');
         }
-
+        
         function saveSettings() {
           const settings = {
             autoReconnect: document.getElementById('autoReconnect').checked,
             antiAfk: document.getElementById('antiAfk').checked,
             chatLog: document.getElementById('chatLog').checked
           };
-
+          
           fetch('/api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1698,140 +1363,10 @@ app.get('/', (req, res) => {
             alert('Settings saved!');
           });
         }
-
+        
         document.getElementById('targetBot').addEventListener('change', function() {
           selectedBotId = this.value;
         });
-
-        // ---- Mining tab ----
-        let miningBotListCache = [];
-
-        function updateMiningBotSelect() {
-          fetch('/api/bots')
-            .then(res => res.json())
-            .then(data => {
-              miningBotListCache = data.bots;
-              const select = document.getElementById('miningBotSelect');
-              const prevValue = select.value;
-              select.innerHTML = '';
-
-              if (data.bots.length === 0) {
-                select.innerHTML = '<option value="">No bots created yet</option>';
-                return;
-              }
-
-              data.bots.sort((a, b) => a.id - b.id).forEach(bot => {
-                const option = document.createElement('option');
-                option.value = bot.id;
-                option.textContent = \`Bot \${bot.id}: \${bot.name}\`;
-                select.appendChild(option);
-              });
-
-              if (prevValue && [...select.options].some(o => o.value === prevValue)) {
-                select.value = prevValue;
-              }
-            });
-        }
-
-        function saveMiningConfig() {
-          const botId = document.getElementById('miningBotSelect').value;
-          if (!botId) {
-            alert('Add a bot first!');
-            return;
-          }
-
-          const c1x = parseInt(document.getElementById('miningC1X').value);
-          const c1y = parseInt(document.getElementById('miningC1Y').value);
-          const c1z = parseInt(document.getElementById('miningC1Z').value);
-          const c2x = parseInt(document.getElementById('miningC2X').value);
-          const c2y = parseInt(document.getElementById('miningC2Y').value);
-          const c2z = parseInt(document.getElementById('miningC2Z').value);
-
-          if ([c1x, c1y, c1z, c2x, c2y, c2z].some(v => Number.isNaN(v))) {
-            alert('Please fill in all X/Y/Z fields for both corners!');
-            return;
-          }
-
-          const blocksRaw = document.getElementById('miningBlocks').value.trim();
-          if (!blocksRaw) {
-            alert('Please enter at least one target block name!');
-            return;
-          }
-          const blocks = blocksRaw.split(',').map(b => b.trim()).filter(b => b.length > 0);
-
-          fetch(\`/api/bot/\${botId}/mining/config\`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              corner1: { x: c1x, y: c1y, z: c1z },
-              corner2: { x: c2x, y: c2y, z: c2z },
-              blocks: blocks
-            })
-          }).then(res => res.json())
-            .then(data => {
-              if (data.success) {
-                alert('Mining zone saved! Toggle it on from the status list below.');
-                updateMiningStatus();
-              } else {
-                alert('Error: ' + (data.error || 'Failed to save zone'));
-              }
-            });
-        }
-
-        function toggleMining(botId) {
-          fetch(\`/api/bot/\${botId}/mining/toggle\`, { method: 'POST' })
-            .then(res => res.json())
-            .then(data => {
-              if (!data.success) {
-                alert('Error: ' + (data.error || 'Set a zone and blocks first'));
-              }
-              updateMiningStatus();
-            });
-        }
-
-        function updateMiningStatus() {
-          if (miningBotListCache.length === 0) {
-            document.getElementById('miningStatusList').innerHTML =
-              '<div style="text-align: center; color: #94a3b8; padding: 1rem;">No bots created yet</div>';
-            return;
-          }
-
-          const requests = miningBotListCache.map(bot =>
-            fetch(\`/api/bot/\${bot.id}/mining/config\`).then(res => res.json()).then(data => ({ bot, config: data.config }))
-          );
-
-          Promise.all(requests).then(results => {
-            const listDiv = document.getElementById('miningStatusList');
-            listDiv.innerHTML = '';
-
-            results.sort((a, b) => a.bot.id - b.bot.id).forEach(({ bot, config }) => {
-              const item = document.createElement('div');
-              item.className = 'bot-item';
-
-              let zoneText = 'No zone set';
-              let enabledText = '';
-              if (config && config.corner1 && config.corner2) {
-                zoneText = \`(\${config.corner1.x}, \${config.corner1.y}, \${config.corner1.z}) → (\${config.corner2.x}, \${config.corner2.y}, \${config.corner2.z})\`;
-                enabledText = config.enabled ? '⛏️ Mining ON' : '⏸️ Mining OFF';
-              }
-
-              item.innerHTML = \`
-                <div class="bot-info">
-                  <div class="bot-name">Bot \${bot.id}: \${bot.name}</div>
-                  <div class="bot-status">\${zoneText}\${enabledText ? ' | ' + enabledText : ''}</div>
-                </div>
-                <div class="bot-controls">
-                  <button class="bot-control-btn \${config && config.enabled ? 'bot-stop' : 'bot-resume'}"
-                    onclick="toggleMining(\${bot.id})"
-                    \${!config || !config.corner1 ? 'disabled' : ''}>
-                    \${config && config.enabled ? 'Stop' : 'Start'}
-                  </button>
-                </div>
-              \`;
-              listDiv.appendChild(item);
-            });
-          });
-        }
       </script>
     </body>
     </html>
@@ -1843,7 +1378,7 @@ app.get('/api/stats', (req, res) => {
   const onlineBots = Array.from(allBots.values()).filter(b => b.online).length;
   const totalBots = allBots.size;
   const stoppedBots = Array.from(botControlStates.entries()).filter(([id, state]) => state === 'STOPPED').length;
-
+  
   res.json({
     totalBots: totalBots,
     onlineBots: onlineBots,
@@ -1856,7 +1391,7 @@ app.get('/api/bots', (req, res) => {
   const botData = Array.from(allBots.entries()).map(([id, data]) => {
     const bot = data.bot;
     const controlState = botControlStates.get(id) || 'RUNNING';
-
+    
     return {
       id: id,
       name: bot ? bot.botName : (botIdentities.get(id)?.name || `Bot_${id}`),
@@ -1869,10 +1404,10 @@ app.get('/api/bots', (req, res) => {
       controlState: controlState
     };
   });
-
+  
   // Sort by ID
   botData.sort((a, b) => a.id - b.id);
-
+  
   res.json({ bots: botData });
 });
 
@@ -1892,7 +1427,7 @@ app.post('/api/console/clear', (req, res) => {
 
 app.post('/api/bots/add', (req, res) => {
   const count = Math.min(parseInt(req.body.count) || 1, MAX_BOTS - allBots.size);
-
+  
   // Find available IDs
   let availableIds = [];
   for (let i = 1; i <= MAX_BOTS; i++) {
@@ -1901,7 +1436,7 @@ app.post('/api/bots/add', (req, res) => {
       if (availableIds.length >= count) break;
     }
   }
-
+  
   const addedIds = [];
   availableIds.slice(0, count).forEach((botId, index) => {
     setTimeout(() => {
@@ -1912,7 +1447,7 @@ app.post('/api/bots/add', (req, res) => {
       }
     }, index * 1000);
   });
-
+  
   addGameLog(`[WEB] Adding ${count} random bot(s)`);
   res.json({ success: true, added: count, botIds: addedIds });
 });
@@ -1920,19 +1455,19 @@ app.post('/api/bots/add', (req, res) => {
 // Add custom bot with specific UUID
 app.post('/api/bots/add-custom', (req, res) => {
   const { name, uuid } = req.body;
-
+  
   if (!name || name.trim() === '') {
     return res.json({ success: false, error: 'Bot name is required' });
   }
-
+  
   if (name.length < 4) {
     return res.json({ success: false, error: 'Bot name must be at least 4 characters' });
   }
-
+  
   if (allBots.size >= MAX_BOTS) {
     return res.json({ success: false, error: `Maximum ${MAX_BOTS} bots reached` });
   }
-
+  
   // Find next available ID
   let nextId = 1;
   for (let i = 1; i <= MAX_BOTS; i++) {
@@ -1941,14 +1476,14 @@ app.post('/api/bots/add-custom', (req, res) => {
       break;
     }
   }
-
+  
   // Create bot with custom identity
   const botId = nextId;
   if (!removedBots.has(botId)) {
     createNewBot(botId, true, name, uuid);
     botControlStates.set(botId, 'RUNNING');
   }
-
+  
   addGameLog(`[WEB] Adding custom bot: ${name}`);
   res.json({ success: true, botId: botId, name: name });
 });
@@ -1957,17 +1492,15 @@ app.post('/api/bots/remove', (req, res) => {
   const botId = parseInt(req.body.botId);
   const permanent = req.body.permanent === true;
   const botData = allBots.get(botId);
-
+  
   if (botData) {
     const bot = botData.bot;
-
-    clearBotTimers(botId);
-
+    
     if (bot) {
       bot.manuallyRemoved = true;
       bot.end();
     }
-
+    
     if (permanent) {
       removedBots.add(botId);
       botIdentities.delete(botId);
@@ -1979,20 +1512,19 @@ app.post('/api/bots/remove', (req, res) => {
       botData.online = false;
       botData.status = 'removed';
     }
-
+    
     const botName = bot ? bot.botName : `Bot_${botId}`;
     addGameLog(`[WEB] Removing bot ${botId} (${botName})`);
   }
-
+  
   res.json({ success: true });
 });
 
 app.post('/api/bots/remove-all', (req, res) => {
   addGameLog(`[WEB] Removing all ${allBots.size} bots permanently`);
-
+  
   allBots.forEach((botData, botId) => {
     const bot = botData.bot;
-    clearBotTimers(botId);
     if (bot) {
       bot.manuallyRemoved = true;
       bot.end();
@@ -2002,7 +1534,7 @@ app.post('/api/bots/remove-all', (req, res) => {
     botControlStates.delete(botId);
     botTargets.delete(botId);
   });
-
+  
   allBots.clear();
   res.json({ success: true });
 });
@@ -2029,7 +1561,7 @@ app.post('/api/bot/:id/start', (req, res) => {
 app.post('/api/bot/:id/toggle', (req, res) => {
   const botId = parseInt(req.params.id);
   const currentState = botControlStates.get(botId) || 'RUNNING';
-
+  
   let success, newState;
   if (currentState === 'RUNNING') {
     success = stopBot(botId);
@@ -2038,82 +1570,25 @@ app.post('/api/bot/:id/toggle', (req, res) => {
     success = startBot(botId);
     newState = 'RUNNING';
   }
-
+  
   res.json({ success, botId, state: newState });
-});
-
-// Mining zone/config endpoints - opt-in, off by default, scoped to a rectangle
-app.post('/api/bot/:id/mining/config', (req, res) => {
-  const botId = parseInt(req.params.id);
-  const { corner1, corner2, blocks } = req.body;
-
-  if (!corner1 || !corner2 || typeof corner1.x !== 'number' || typeof corner2.x !== 'number') {
-    return res.json({ success: false, error: 'corner1 and corner2 with x,y,z are required' });
-  }
-  if (!Array.isArray(blocks) || blocks.length === 0) {
-    return res.json({ success: false, error: 'blocks must be a non-empty array of block names' });
-  }
-
-  const existing = botMiningConfig.get(botId) || { enabled: false };
-  botMiningConfig.set(botId, {
-    enabled: existing.enabled || false,
-    corner1: { x: corner1.x, y: corner1.y, z: corner1.z },
-    corner2: { x: corner2.x, y: corner2.y, z: corner2.z },
-    blocks: blocks
-  });
-
-  addGameLog(`[WEB] Mining zone set for bot ${botId}: ${JSON.stringify(corner1)} to ${JSON.stringify(corner2)}, blocks: ${blocks.join(', ')}`);
-  res.json({ success: true, config: botMiningConfig.get(botId) });
-});
-
-app.post('/api/bot/:id/mining/toggle', (req, res) => {
-  const botId = parseInt(req.params.id);
-  const cfg = botMiningConfig.get(botId);
-
-  if (!cfg || !cfg.corner1 || !cfg.corner2 || !cfg.blocks || cfg.blocks.length === 0) {
-    return res.json({ success: false, error: 'Set a mining zone and block list first via /api/bot/:id/mining/config' });
-  }
-
-  cfg.enabled = !cfg.enabled;
-  botMiningConfig.set(botId, cfg);
-
-  const botData = allBots.get(botId);
-  if (cfg.enabled) {
-    addGameLog(`⛏️ Mining mode ENABLED for bot ${botId}`, botId);
-    if (botData && botData.bot && botData.online) {
-      startMiningLoop(botData.bot, botId);
-    }
-  } else {
-    addGameLog(`⛏️ Mining mode DISABLED for bot ${botId}`, botId);
-    stopMiningLoop(botId);
-    if (botData && botData.bot && botData.bot.pathfinder) {
-      try { botData.bot.pathfinder.setGoal(null); } catch (e) {}
-    }
-  }
-
-  res.json({ success: true, enabled: cfg.enabled });
-});
-
-app.get('/api/bot/:id/mining/config', (req, res) => {
-  const botId = parseInt(req.params.id);
-  res.json({ config: botMiningConfig.get(botId) || null });
 });
 
 app.post('/api/command', (req, res) => {
   const { command, target = 'all' } = req.body;
-
+  
   if (!command || command.trim() === '') {
     return res.json({ success: false, error: 'No command provided' });
   }
-
+  
   let sentTo = [];
-
+  
   if (target === 'all') {
     allBots.forEach((botData, botId) => {
       const bot = botData.bot;
       const controlState = botControlStates.get(botId);
       if (bot && botData.online && controlState !== 'STOPPED') {
-        safeChat(bot, command);
+        bot.chat(command);
         sentTo.push(botId);
       }
     });
@@ -2123,14 +1598,14 @@ app.post('/api/command', (req, res) => {
     const botData = allBots.get(botId);
     const controlState = botControlStates.get(botId);
     if (botData && botData.bot && botData.online && controlState !== 'STOPPED') {
-      safeChat(botData.bot, command);
+      botData.bot.chat(command);
       sentTo.push(botId);
       addGameLog(`[WEB] Command to bot ${botId}: ${command}`);
     }
   }
-
-  res.json({
-    success: true,
+  
+  res.json({ 
+    success: true, 
     command: command,
     sentTo: sentTo,
     timestamp: new Date().toISOString()
@@ -2140,32 +1615,31 @@ app.post('/api/command', (req, res) => {
 app.post('/api/update-server', (req, res) => {
   const { ip, port } = req.body;
   const newPort = parseInt(port);
-
+  
   if (!ip || !port) {
     return res.json({ success: false, error: 'Missing IP or port' });
   }
-
+  
   addToHistory(ip, newPort);
-
+  
   config.server.ip = ip;
   config.server.port = newPort;
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-
+  
   addGameLog(`[WEB] Changing server to ${ip}:${newPort}`);
-
+  
   // Disconnect all bots
-  allBots.forEach((botData, botId) => {
+  allBots.forEach((botData) => {
     const bot = botData.bot;
-    clearBotTimers(botId);
     if (bot) {
       bot.end();
     }
   });
-
+  
   // Clear allBots but keep identities and control states
   allBots.clear();
   botTargets.clear();
-
+  
   // Reconnect all bots to new server (except stopped ones)
   setTimeout(() => {
     const botIds = Array.from(botIdentities.keys());
@@ -2175,17 +1649,17 @@ app.post('/api/update-server', (req, res) => {
       }
     });
   }, 2000);
-
+  
   res.json({ success: true });
 });
 
 app.post('/api/settings', (req, res) => {
   const { autoReconnect, antiAfk, chatLog } = req.body;
-
+  
   config.utils["auto-reconnect"] = autoReconnect;
   config.utils["anti-afk"] = antiAfk;
   config.utils["chat-log"] = chatLog;
-
+  
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
   res.json({ success: true });
 });
@@ -2218,7 +1692,7 @@ app.listen(PORT, '0.0.0.0', () => {
   }
 
   setInterval(keepAlive, KEEP_ALIVE_INTERVAL);
-
+  
   const initialBots = config.botAccount?.initialCount || 1;
   if (initialBots > 0) {
     addGameLog(`[SYSTEM] Starting ${initialBots} initial bots...`);
