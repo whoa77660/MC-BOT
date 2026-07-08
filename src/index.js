@@ -376,48 +376,38 @@ function startMovementLoop(bot, botNumber) {
 }
 
 // Create new bot with connection throttling
+// ---------------------------------------------------------------------------
+// Full player-like AI: movement + breaking + placing + sprint + chat
+// ---------------------------------------------------------------------------
+
 function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, customUUID = null) {
   if (removedBots.has(botNumber)) {
     console.log(`[BOT ${botNumber}] This bot was manually removed. Not recreating.`);
     return null;
   }
-
-  // Check if bot is manually stopped
   if (botControlStates.get(botNumber) === 'STOPPED') {
     addGameLog(`⏸️ Bot ${botNumber} is manually stopped. Not connecting.`, botNumber);
     return null;
   }
-
-  // Check global leave mode
   if (globalLeaveMode) {
     addGameLog(`🌍 Skipping connection due to global leave mode`, botNumber);
-
-    // Schedule reconnect after global leave ends
     setTimeout(() => {
       if (!globalLeaveMode && !removedBots.has(botNumber)) {
         const controlState = botControlStates.get(botNumber);
-        if (controlState !== 'STOPPED') {
-          createNewBot(botNumber, false);
-        }
+        if (controlState !== 'STOPPED') createNewBot(botNumber, false);
       }
-    }, 61000); // Slightly more than 1 minute
-
+    }, 61000);
     return null;
   }
 
-  // Check connection throttling
-  const botData = allBots.get(botNumber);
-  if (botData && botData.reconnectAttempts > 3) {
-    const timeSinceLastAttempt = Date.now() - botData.lastReconnectAttempt;
-    if (timeSinceLastAttempt < 30000) { // 30 seconds throttle
+  const botDataExisting = allBots.get(botNumber);
+  if (botDataExisting && botDataExisting.reconnectAttempts > 3) {
+    const timeSinceLastAttempt = Date.now() - botDataExisting.lastReconnectAttempt;
+    if (timeSinceLastAttempt < 30000) {
       const waitTime = Math.ceil((30000 - timeSinceLastAttempt) / 1000);
-      addGameLog(`⏳ Connection throttled for bot ${botNumber}. Please wait ${waitTime}s before reconnect.`, botNumber);
-
-      // Schedule reconnect after throttle period
+      addGameLog(`⏳ Connection throttled for bot ${botNumber}. Wait ${waitTime}s.`, botNumber);
       setTimeout(() => {
-        if (!removedBots.has(botNumber)) {
-          createNewBot(botNumber, false);
-        }
+        if (!removedBots.has(botNumber)) createNewBot(botNumber, false);
       }, 30000 - timeSinceLastAttempt);
       return null;
     }
@@ -429,8 +419,6 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
   } else {
     identity = getBotIdentity(botNumber);
   }
-
-  // Validate custom name length
   if (customName && customName.length < 4) {
     addGameLog(`❌ Custom name must be at least 4 characters: ${customName}`, botNumber);
     return null;
@@ -438,7 +426,6 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
 
   const botName = identity.name;
   const botUUID = identity.uuid;
-
   addGameLog(`🔗 Connecting as ${botName}`, botNumber);
 
   const bot = mineflayer.createBot({
@@ -448,10 +435,8 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     uuid: botUUID,
     version: config.server.version || "1.20.1",
     auth: "offline",
-    checkTimeoutInterval: 120000,   // 2 minutes (internal mineflayer timeout)
-    keepAlive: true,                // send frequent keep-alive packets to server
-    keepAliveInterval: 5000,        // send every 5 seconds
-    hideErrors: true
+    checkTimeoutInterval: 120000,
+    hideErrors: false    // show connection errors while testing
   });
 
   bot.botId = botNumber;
@@ -465,33 +450,43 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
   bot.combatMode = false;
   bot.controlState = botControlStates.get(botNumber) || 'RUNNING';
 
-  // Update bot data in allBots map
   allBots.set(botNumber, {
     bot: bot,
     online: false,
     lastSeen: new Date().toISOString(),
     status: 'connecting',
-    reconnectAttempts: botData ? botData.reconnectAttempts + 1 : 1,
+    reconnectAttempts: botDataExisting ? botDataExisting.reconnectAttempts + 1 : 1,
     lastReconnectAttempt: Date.now(),
     health: 20,
     food: 20,
     controlState: bot.controlState
   });
 
-  let defaultMove = null;
-
+  // Load plugins
   bot.on('inject_allowed', () => {
     const mcData = require('minecraft-data')(bot.version || "1.20.1");
     if (mcData) {
       bot.loadPlugin(pathfinder);
       bot.loadPlugin(pvp);
-      defaultMove = new Movements(bot, mcData);
+      const defaultMove = new Movements(bot, mcData);
       defaultMove.canDig = false;
       defaultMove.allow1by1towers = false;
       bot.pathfinder.setMovements(defaultMove);
+
+      // Auto-eat plugin (requires npm install mineflayer-auto-eat)
+      try {
+        bot.loadPlugin(require('mineflayer-auto-eat').plugin);
+        bot.autoEat.options.priority = 'foodPoints';
+        bot.autoEat.options.bannedFood = [];
+        bot.autoEat.options.eatingTimeout = 3;
+        bot.autoEat.enable();
+      } catch (e) {
+        console.log('[AUTO-EAT] Plugin not found (run npm install mineflayer-auto-eat)');
+      }
     }
   });
 
+  // ==================== SPAWN ====================
   bot.once('spawn', () => {
     addGameLog(`✅ Spawned in world.`, botNumber);
 
@@ -499,90 +494,106 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     if (botData) {
       botData.online = true;
       botData.status = 'online';
-      botData.reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+      botData.reconnectAttempts = 0;
     }
 
     bot.settings.colorsEnabled = false;
 
-    // Update health and food
     bot.on('health', () => {
-      const botData = allBots.get(botNumber);
-      if (botData) {
-        botData.health = bot.health;
-        botData.food = bot.food;
-      }
+      const bd = allBots.get(botNumber);
+      if (bd) bd.health = bot.health;
     });
 
-    // Natural anti-AFK movement
+    // --- NATURAL ANTI-AFK MOVEMENT (your improved version) ---
     const timers = getTimerBucket(botNumber);
     if (config.utils["anti-afk"] !== false) {
       startMovementLoop(bot, botNumber);
     }
 
-    // Optional heartbeat chat to prevent idle kicks
+    // --- OPTIONAL CHAT HEARTBEAT (every 5-10 minutes) ---
     if (config.utils["chat-heartbeat"] !== false) {
       timers.heartbeatInterval = setInterval(() => {
         safeChat(bot, '/help');
-      }, 60000 + Math.random() * 60000);
+      }, 300000 + Math.random() * 300000);
     }
 
-    // Combat AI - Only attacks when attacked first
+    // --- BLOCK INTERACTION + PLAYER ACTIONS ---
+    // Runs every 2-5 seconds, performing human-like world interactions
+    let actionInterval;
+    function scheduleAction() {
+      if (!bot?.entity || bot.combatMode) {
+        actionInterval = setTimeout(scheduleAction, 3000);
+        return;
+      }
+      const actions = [
+        'breakBlock',
+        'placeBlock',
+        'sprintJump',
+        'sneak',
+        'idleChat',
+        'lookAround'
+      ];
+      const action = actions[Math.floor(Math.random() * actions.length)];
+      try {
+        switch (action) {
+          case 'breakBlock': tryBreakBlock(bot); break;
+          case 'placeBlock': tryPlaceBlock(bot); break;
+          case 'sprintJump':
+            bot.setControlState('sprint', true);
+            bot.setControlState('jump', true);
+            bot.setControlState('forward', true);
+            setTimeout(() => {
+              bot.setControlState('sprint', false);
+              bot.setControlState('jump', false);
+              bot.setControlState('forward', false);
+            }, 1500);
+            break;
+          case 'sneak':
+            bot.setControlState('sneak', true);
+            setTimeout(() => bot.setControlState('sneak', false), 1200);
+            break;
+          case 'idleChat':
+            const phrases = ['Hello!', 'Nice day.', 'How are you?', 'Good game.', 'Lol', 'GG', 'Cool house.', 'Anyone here?'];
+            safeChat(bot, phrases[Math.floor(Math.random() * phrases.length)]);
+            break;
+          case 'lookAround':
+            bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI / 2 - Math.PI / 4);
+            bot.swingArm('right');
+            break;
+        }
+      } catch (e) {}
+      actionInterval = setTimeout(scheduleAction, 2000 + Math.random() * 3000);
+    }
+    scheduleAction();
+
+    // --- COMBAT AI (unchanged) ---
     bot.on('entityHurt', (entity) => {
       if (entity !== bot.entity) return;
-
       const damageEvents = Object.values(bot.entity.damageHistory || {});
       if (damageEvents.length === 0) return;
-
       const recentDamage = damageEvents[damageEvents.length - 1];
       const attacker = recentDamage.attacker;
-
-      // Only attack if a player attacked first and we don't already have a target
       if (attacker && attacker.type === 'player' && !bot.lockedTarget) {
         bot.lockedTarget = attacker;
         bot.combatMode = true;
         bot.lastAttackTime = Date.now();
-
         const attackerName = attacker.username || 'Unknown';
-
-        // Store target
-        botTargets.set(botNumber, {
-          targetPlayer: attackerName,
-          lastMessageTime: Date.now()
-        });
-
-        // Send mocking message
+        botTargets.set(botNumber, { targetPlayer: attackerName, lastMessageTime: Date.now() });
         const message = getMockingMessage(attackerName);
-        setTimeout(() => {
-          if (bot.entity) {
-            safeChat(bot, message);
-            addGameLog(`🗣️ "${message}"`, botNumber);
-          }
-        }, 1000);
-
-        addGameLog(`🔒 Locked on ${attackerName}! Combat mode activated.`, botNumber);
-
-        // Auto equip best weapon
-        const weapons = bot.inventory.items().filter(item =>
-          item.name.includes('sword') || item.name.includes('axe')
-        );
-
+        setTimeout(() => { if (bot.entity) safeChat(bot, message); }, 1000);
+        addGameLog(`🔒 Locked on ${attackerName}!`, botNumber);
+        const weapons = bot.inventory.items().filter(item => item.name.includes('sword') || item.name.includes('axe'));
         if (weapons.length > 0) {
           const bestWeapon = weapons.reduce((best, item) => {
             const damage = getWeaponDamage(item.name);
             return damage > best.damage ? { item, damage } : best;
           }, { item: null, damage: 0 });
-
-          if (bestWeapon.item) {
-            bot.equip(bestWeapon.item, 'hand').catch(() => {});
-          }
+          if (bestWeapon.item) bot.equip(bestWeapon.item, 'hand').catch(() => {});
         }
-
-        // Start combat routine
         startCombatRoutine(bot, botNumber);
       }
     });
 
-    // Clear target on death
     bot.on('death', () => {
       addGameLog(`☠️ Bot died.`, botNumber);
       bot.combatMode = false;
@@ -591,131 +602,97 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       if (bot.pvp) bot.pvp.stop();
     });
 
-    // Chat logging with "bot leave" command detection
+    // --- CHAT & PLAYER EVENTS (unchanged) ---
     bot.on('chat', (username, message) => {
       if (username !== bot.username) {
         addGameLog(`💬 <${username}> ${message}`, botNumber);
-
-        // Check for global leave command (case insensitive)
-        if (message.toLowerCase().includes('bot leave')) {
-          activateGlobalLeave();
-        }
+        if (message.toLowerCase().includes('bot leave')) activateGlobalLeave();
       }
-
-      if (message.toLowerCase().includes('was killed') ||
-          message.toLowerCase().includes('slain') ||
-          message.toLowerCase().includes('died')) {
+      if (message.toLowerCase().includes('was killed') || message.toLowerCase().includes('slain') || message.toLowerCase().includes('died'))
         addGameLog(`💀 ${message}`, botNumber);
-      }
-
-      if (message.toLowerCase().includes('joined') ||
-          message.toLowerCase().includes('left') ||
-          message.toLowerCase().includes('achievement') ||
-          message.toLowerCase().includes('advancement')) {
+      if (message.toLowerCase().includes('joined') || message.toLowerCase().includes('left') || message.toLowerCase().includes('achievement') || message.toLowerCase().includes('advancement'))
         addGameLog(`📢 ${message}`, botNumber);
-      }
     });
+    bot.on('playerJoined', (player) => { if (player.username !== bot.username) addGameLog(`➡️ ${player.username} joined`, botNumber); });
+    bot.on('playerLeft', (player) => { if (player.username !== bot.username) addGameLog(`⬅️ ${player.username} left`, botNumber); });
 
-    // Player join/leave events
-    bot.on('playerJoined', (player) => {
-      if (player.username !== bot.username) {
-        addGameLog(`➡️ ${player.username} joined the game`, botNumber);
-      }
-    });
-
-    bot.on('playerLeft', (player) => {
-      if (player.username !== bot.username) {
-        addGameLog(`⬅️ ${player.username} left the game`, botNumber);
-      }
-    });
-
-    // AUTH SEQUENCE
+    // AUTH & join-command
     if (config.utils["auto-auth"]?.enabled) {
       const pass = config.utils["auto-auth"].password;
-
       setTimeout(() => {
         safeChat(bot, `/register ${pass} ${pass}`);
-
         setTimeout(() => {
           safeChat(bot, `/login ${pass}`);
-
-          if (config.utils["join-command"]?.enabled) {
-            const cmd = config.utils["join-command"].command;
-            setTimeout(() => {
-              safeChat(bot, cmd);
-            }, 2000);
-          }
+          if (config.utils["join-command"]?.enabled) setTimeout(() => safeChat(bot, config.utils["join-command"].command), 2000);
         }, 2000);
       }, 2000);
     } else if (config.utils["join-command"]?.enabled) {
-      const cmd = config.utils["join-command"].command;
-      setTimeout(() => {
-        safeChat(bot, cmd);
-      }, 4000);
+      setTimeout(() => safeChat(bot, config.utils["join-command"].command), 4000);
     }
   });
 
-  // KICK HANDLING - Bot stays in list
+  // ==================== HELPER: BREAK BLOCK ====================
+  function tryBreakBlock(bot) {
+    const block = bot.blockAtCursor(5);
+    if (block && bot.canDigBlock(block)) {
+      const tool = getBestToolForBlock(block.name, bot);
+      if (tool) bot.equip(tool, 'hand').catch(() => {});
+      bot.dig(block, (err) => {
+        if (err) console.log(`Dig error: ${err.message}`);
+      });
+    }
+  }
+
+  // ==================== HELPER: PLACE BLOCK ====================
+  function tryPlaceBlock(bot) {
+    const block = bot.inventory.items().find(item => 
+      item.name.includes('dirt') || item.name.includes('cobblestone') || item.name.includes('planks')
+    );
+    if (!block) return;
+    bot.equip(block, 'hand').catch(() => {});
+    const refBlock = bot.blockAtCursor(5);
+    if (refBlock) {
+      // Vec3 is required
+      const { Vec3 } = require('vec3');
+      bot.placeBlock(refBlock, new Vec3(0, 1, 0), (err) => {
+        if (err) console.log(`Place error: ${err.message}`);
+      });
+    }
+  }
+
+  // ==================== KICK / ERROR / RECONNECT (unchanged) ====================
   bot.on('kicked', (reason) => {
     const kickMsg = typeof reason === 'string' ? reason : JSON.stringify(reason);
     bot.lastKickReason = kickMsg;
-
     addGameLog(`🚫 Kicked: ${kickMsg.substring(0, 100)}`, botNumber);
-
     clearBotTimers(botNumber);
-
-    // Update bot status
-    const botData = allBots.get(botNumber);
-    if (botData) {
-      botData.online = false;
-      botData.status = 'kicked';
-      botData.lastSeen = new Date().toISOString();
-      botData.lastReconnectAttempt = Date.now();
-    }
-
-    const isBan = kickMsg.toLowerCase().includes("ban") ||
-                  kickMsg.toLowerCase().includes("banned") ||
-                  kickMsg.toLowerCase().includes("permanent") ||
-                  kickMsg.toLowerCase().includes("blacklist") ||
-                  kickMsg.toLowerCase().includes("hacking") ||
-                  kickMsg.toLowerCase().includes("cheat");
-
-    if (isBan) {
-      addGameLog(`🔨 BAN detected! Generating new identity...`, botNumber);
-      bot.isBanned = true;
-      generateNewIdentity(botNumber);
-    } else {
-      addGameLog(`Regular kick. Will reconnect with same identity.`, botNumber);
-      bot.isBanned = false;
-    }
+    const bd = allBots.get(botNumber);
+    if (bd) { bd.online = false; bd.status = 'kicked'; bd.lastSeen = new Date().toISOString(); bd.lastReconnectAttempt = Date.now(); }
+    const isBan = kickMsg.toLowerCase().includes("ban") || kickMsg.toLowerCase().includes("banned") || kickMsg.toLowerCase().includes("permanent") || kickMsg.toLowerCase().includes("blacklist") || kickMsg.toLowerCase().includes("hacking") || kickMsg.toLowerCase().includes("cheat");
+    if (isBan) { bot.isBanned = true; generateNewIdentity(botNumber); }
+    else bot.isBanned = false;
   });
 
   bot.on('error', (err) => {
     addGameLog(`❌ Error: ${err.message}`, botNumber);
-
     clearBotTimers(botNumber);
-
-    // Update bot status
-    const botData = allBots.get(botNumber);
-    if (botData) {
-      botData.online = false;
-      botData.status = 'error';
-      botData.lastSeen = new Date().toISOString();
-      botData.lastReconnectAttempt = Date.now();
-    }
+    const bd = allBots.get(botNumber);
+    if (bd) { bd.online = false; bd.status = 'error'; bd.lastSeen = new Date().toISOString(); bd.lastReconnectAttempt = Date.now(); }
   });
 
-  // AUTO-RECONNECT with throttle
   bot.on('end', () => {
     clearBotTimers(botNumber);
+    const bd = allBots.get(botNumber);
+    if (bd) { bd.online = false; bd.status = 'disconnected'; bd.lastSeen = new Date().toISOString(); }
+    if (botControlStates.get(botNumber) === 'STOPPED') return;
+    if (bot.manuallyRemoved || removedBots.has(botNumber) || !config.utils["auto-reconnect"]) return;
+    const delay = config.utils["auto-reconnect-delay"] || 15000;
+    addGameLog(`Reconnecting in ${delay/1000}s...`, botNumber);
+    setTimeout(() => { if (!removedBots.has(botNumber)) createNewBot(botNumber, false); }, delay);
+  });
 
-    // Update bot status
-    const botData = allBots.get(botNumber);
-    if (botData) {
-      botData.online = false;
-      botData.status = 'disconnected';
-      botData.lastSeen = new Date().toISOString();
-    }
+  return bot;
+}
 
     // Check if manually stopped
     if (botControlStates.get(botNumber) === 'STOPPED') {
