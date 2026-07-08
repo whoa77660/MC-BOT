@@ -313,9 +313,11 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     uuid: botUUID,
     version: config.server.version || "1.20.1",
     auth: "offline",
-    checkTimeoutInterval: 60000,
+    checkTimeoutInterval: 120000,   // 2 minutes (internal mineflayer timeout)
+    keepAlive: true,                // send frequent keep-alive packets to server
+    keepAliveInterval: 5000,        // send every 5 seconds (default is fine)
     hideErrors: true
-  });
+});
   
   bot.botId = botNumber;
   bot.botName = botName;
