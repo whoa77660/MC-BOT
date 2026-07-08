@@ -16,6 +16,7 @@
       "password": "P667788"
     },
     "chat-log": true,
+    "chat-heartbeat": true,
     "auto-reconnect": true,
     "auto-reconnect-delay": 15000,
     "anti-afk": true,
