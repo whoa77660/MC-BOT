@@ -695,37 +695,7 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
 }
 
     // Check if manually stopped
-    if (botControlStates.get(botNumber) === 'STOPPED') {
-      addGameLog(`⏸️ Bot ${botNumber} is manually stopped. No auto-reconnect.`, botNumber);
-      return;
-    }
 
-    if (bot.manuallyRemoved) {
-      addGameLog(`Bot ${botNumber} was manually removed. No auto-reconnect.`, botNumber);
-      return;
-    }
-
-    if (!config.utils["auto-reconnect"]) {
-      addGameLog(`Auto-reconnect disabled for bot ${botNumber}`, botNumber);
-      return;
-    }
-
-    if (removedBots.has(botNumber)) {
-      return;
-    }
-
-    const delay = config.utils["auto-reconnect-delay"] || 15000;
-    addGameLog(`Reconnecting bot ${botNumber} in ${delay/1000}s...`, botNumber);
-
-    setTimeout(() => {
-      if (!removedBots.has(botNumber)) {
-        createNewBot(botNumber, false);
-      }
-    }, delay);
-  });
-
-  return bot;
-}
 
 // Helper functions
 function getWeaponDamage(itemName) {
