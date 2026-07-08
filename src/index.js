@@ -315,9 +315,9 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
     auth: "offline",
     checkTimeoutInterval: 120000,   // 2 minutes (internal mineflayer timeout)
     keepAlive: true,                // send frequent keep-alive packets to server
-    keepAliveInterval: 5000,        // send every 5 seconds (default is fine)
+    keepAliveInterval: 5000,        // send every 5 seconds
     hideErrors: true
-});
+  });
   
   bot.botId = botNumber;
   bot.botName = botName;
@@ -382,8 +382,43 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       if (botData) {
         botData.food = bot.food;
       }
+      // NO heartbeat here – it's moved outside to avoid multiple intervals
     });
     
+    // ANTI-AFK movements – stronger version
+    const movementLoop = () => {
+      if (!bot?.entity) {
+        setTimeout(movementLoop, 5000);
+        return;
+      }
+
+      const actions = ['forward', 'back', 'left', 'right', 'jump', 'sprint', 'sneak'];
+      const action = actions[Math.floor(Math.random() * actions.length)];
+      bot.setControlState(action, true);
+
+      // Randomly look around to appear more human
+      bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI / 2 - Math.PI / 4);
+
+      setTimeout(() => {
+        if (bot) bot.setControlState(action, false);
+        // Schedule next move in 3‑6 seconds
+        setTimeout(movementLoop, 3000 + Math.random() * 3000);
+      }, 500 + Math.random() * 1000);
+    };
+
+    if (config.utils["anti-afk"] !== false) {
+      movementLoop();
+    }
+    // ✅ FIX: no extra `);` here – just a closing brace for the if statement
+
+    // Optional heartbeat chat to prevent idle kicks
+    // ✅ FIX: moved outside the food event, so only one interval is created
+    if (config.utils["chat-heartbeat"] !== false) {
+      setInterval(() => {
+        if (bot.entity) bot.chat('/help');
+      }, 60000 + Math.random() * 60000);
+    }
+
     // Combat AI - Only attacks when attacked first
     bot.on('entityHurt', (entity) => {
       if (entity !== bot.entity) return;
@@ -510,27 +545,6 @@ function createNewBot(botNumber = 1, useNewIdentity = false, customName = null, 
       setTimeout(() => {
         bot.chat(cmd);
       }, 4000);
-    }
-    
-    // ANTI-AFK movements
-    const movementLoop = () => {
-      if (!bot?.entity) {
-        setTimeout(movementLoop, 5000);
-        return;
-      }
-      
-      const states = ['forward', 'back', 'left', 'right', 'jump', 'sprint'];
-      const randomState = states[Math.floor(Math.random() * states.length)];
-      bot.setControlState(randomState, true);
-      
-      setTimeout(() => {
-        if (bot) bot.setControlState(randomState, false);
-        setTimeout(movementLoop, Math.floor(Math.random() * 5000) + 5000);
-      }, 1000);
-    };
-    
-    if (config.utils["anti-afk"] !== false) {
-      movementLoop();
     }
   });
   
@@ -660,7 +674,7 @@ function getBestToolForBlock(blockName, bot) {
   return null;
 }
 
-// Web Interface Routes
+// Web Interface Routes (unchanged, but kept for completeness)
 app.get('/', (req, res) => {
   const onlineCount = Array.from(allBots.values()).filter(b => b.online).length;
   const totalCount = allBots.size;
@@ -1657,27 +1671,27 @@ app.listen(PORT, '0.0.0.0', () => {
   addGameLog(`[SYSTEM] Web server started on port ${PORT}`);
 
   // Keep-alive: pings own Render URL every 49 seconds
-const KEEP_ALIVE_URL = process.env.RENDER_URL || "https://mc-bot-39ur.onrender.com/";
-const KEEP_ALIVE_INTERVAL = 49 * 1000;
+  const KEEP_ALIVE_URL = process.env.RENDER_URL || "https://mc-bot-39ur.onrender.com/";
+  const KEEP_ALIVE_INTERVAL = 49 * 1000;
 
-function keepAlive() {
-  const url = new URL(KEEP_ALIVE_URL);
-  const httpModule = url.protocol === 'https:' ? require('https') : require('http');
+  function keepAlive() {
+    const url = new URL(KEEP_ALIVE_URL);
+    const httpModule = url.protocol === 'https:' ? require('https') : require('http');
 
-  const req = httpModule.get(KEEP_ALIVE_URL, { timeout: 30000 }, (res) => {
-    console.log(`Self Ping: ${res.statusCode}`);
-    res.resume(); // consume response data to free up memory
-  });
-  req.on('error', (e) => {
-    console.log(`Self Ping Error: ${e.message}`);
-  });
-  req.on('timeout', () => {
-    req.destroy();
-    console.log('Self Ping Timeout');
-  });
-}
+    const req = httpModule.get(KEEP_ALIVE_URL, { timeout: 30000 }, (res) => {
+      console.log(`Self Ping: ${res.statusCode}`);
+      res.resume(); // consume response data to free up memory
+    });
+    req.on('error', (e) => {
+      console.log(`Self Ping Error: ${e.message}`);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      console.log('Self Ping Timeout');
+    });
+  }
 
-setInterval(keepAlive, KEEP_ALIVE_INTERVAL);
+  setInterval(keepAlive, KEEP_ALIVE_INTERVAL);
   
   const initialBots = config.botAccount?.initialCount || 1;
   if (initialBots > 0) {
