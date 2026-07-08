@@ -1,13 +1,13 @@
 {
   "botAccount": {
-    "namePrefix": "Bot_ProPixel_",
+    "namePrefix": "Rahmttollah",
     "randomName": true,
     "initialCount": 0,
     "type": "offline"
   },
   "server": {
-    "ip": "YouTubeSeason1.aternos.me",
-    "port": 21942,
+    "ip": "Rahmttollahai.aternos.me",
+    "port": 11223,
     "version": "1.20.1"
   },
   "utils": {
